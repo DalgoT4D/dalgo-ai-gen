@@ -1,0 +1,18 @@
+ai-llm-service
+airbyte
+clients_dbt
+dalgo_dbt_venv
+DDP_backend
+jupyter-scratch
+platform_infra
+prefect-airbyte
+prefect-proxy
+secrets
+webapp
+webapp_v2
+dalgo_dev.config.js
+
+.DS_Store
+
+
+# add more things you want to ignore here
