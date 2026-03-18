@@ -26,12 +26,13 @@ The feature is implemented across:
 - Browser polling is not allowed.
 - The reviewed transport is:
   - HTTP for org settings, status, and context management
-  - authenticated WebSocket for starting chat sessions, sending chat messages, resuming chat sessions, and receiving queued/progress/answer/error/done events
+  - authenticated WebSocket for sending chat messages and receiving progress/assistant_message/error events
 - LangGraph is the orchestration layer.
 - We do not add `langchain` as a production dependency.
 - Chroma runs as a sidecar container and stores one collection per org: `org_<org_id>`.
 - dbt artifacts are refreshed every 3 hours, org by org, using `dbt deps` and `dbt docs generate` through Dalgo’s existing dbt setup.
 - Chat persistence uses dedicated `DashboardChatSession` and `DashboardChatMessage` tables. It does not reuse `LlmSession`.
+- If we show progress in v1, it is a single user-safe label: `thinking`. We do not expose raw reasoning or tool-call internals.
 
 ### Must-keep product behaviors
 
@@ -43,21 +44,25 @@ The feature is implemented across:
 - Retrieval from org context, dashboard context, dashboard export, dbt manifest, and dbt catalog.
 - Cross-dashboard guidance when the current dashboard is not the right context for the user’s question.
 - Source citations in the final answer payload.
-- Future support for showing sanitized “agent steps” without storing or exposing raw chain-of-thought.
+- If progress is shown, it is coarse and user-safe rather than raw reasoning.
 
 ---
 
 ## 2. Approach
 
+### What we are reusing from existing work
+
+- Keep the dashboard export endpoint from backend PR `#1255` as the context contract for chart and dashboard metadata.
+- From backend PR `#1199`, reuse only any useful settings, permission, and feature-flag patterns that still match current Dalgo conventions. Do not reuse its chat runtime, transport, or persistence design.
+- From frontend PR `#162`, reuse only the useful shell and layout ideas for the dashboard chat trigger, panel, and settings UI. Replace its transport and API contract completely.
+
 ### Why dedicated chat session and message tables?
 
 Dashboard chat is a multi-turn, dashboard-scoped, websocket-delivered workflow. It needs:
 
-- session lifecycle state
 - ordered message history
-- per-message chart focus
 - assistant payloads with citations and SQL summaries
-- sanitized graph progress trace
+- optional user-safe progress events
 
 This is a different persistence problem from Dalgo’s existing summarization flows. The clean design is dedicated `DashboardChatSession` and `DashboardChatMessage` tables rather than extending `LlmSession` or storing the entire conversation in one JSON column.
 
@@ -67,16 +72,11 @@ Dalgo already has authenticated websocket consumers built on `BaseConsumer`, JWT
 
 - HTTP remains for settings, consent, context editing, and readiness/status reads.
 - WebSocket handles:
-  - `start_session`
   - `send_message`
-  - `resume_session`
 - The same socket then delivers:
-  - `session_started`
-  - `queued`
   - `progress`
   - `assistant_message`
   - `error`
-  - `done`
 
 This matches Dalgo’s existing consumer model better and removes chat-specific write APIs that are not strictly necessary.
 
@@ -86,45 +86,36 @@ This matches Dalgo’s existing consumer model better and removes chat-specific 
 User opens dashboard
   -> frontend calls org status/settings APIs over HTTP
   -> frontend opens authenticated dashboard-chat websocket
-  -> frontend sends start_session
-  -> backend creates DashboardChatSession and returns session_started
-  -> user sends send_message over the same websocket
-  -> backend stores a DashboardChatMessage(role=user), marks session queued, and emits queued
+  -> user sends send_message over the websocket
+  -> if no session_id is provided, backend creates DashboardChatSession
+  -> backend stores a DashboardChatMessage(role=user) and starts processing
   -> worker loads org/dashboard context, queries Chroma, builds allowlist, and runs LangGraph
   -> worker validates and executes safe SQL if needed
+  -> worker publishes a progress event with label `thinking`
   -> worker stores a DashboardChatMessage(role=assistant) and publishes events to the session channel group
-  -> backend emits done
   -> later turns reuse the same session_id over the same websocket
-  -> on reconnect, frontend sends resume_session to get the persisted message history for that session
+  -> a full page refresh starts a new chat session in v1
 ```
 
-### How ingestion works
+### How AI context build works
 
 ```text
 Org eligible for AI dashboard chat
-  -> scheduler enqueues one ingest job for that org
+  -> scheduler enqueues one context-build job for that org
   -> worker runs dbt deps + dbt docs generate
   -> worker reads:
      - OrgAIContext.markdown
      - DashboardAIContext.markdown for dashboards in the org
      - GET /api/dashboards/{id}/export/ payloads
-     - OrgDbt.manifest_json
-     - OrgDbt.catalog_json
+     - generated manifest.json from the dbt workspace
+     - generated catalog.json from the dbt workspace
   -> worker chunks documents deterministically
   -> worker diffs against the org’s Chroma collection
   -> worker upserts changed docs and deletes stale/disabled-source docs
-  -> worker stores manifest/catalog JSON and freshness timestamps on OrgDbt
+  -> worker stores freshness timestamps on OrgDbt
 ```
 
-### How targeted re-ingest works
-
-Targeted re-ingest is triggered by:
-
-- org context changes
-- dashboard context changes
-- dashboard export changes that affect chart context
-
-Targeted re-ingest does **not** rerun `dbt docs generate`. It reuses the latest successful `manifest_json` and `catalog_json` already stored on `OrgDbt` and rebuilds the vector collection with the latest markdown and dashboard export content.
+In v1, saved org and dashboard context changes are picked up by the next scheduled context-build run. We do not add a separate targeted re-ingest path.
 
 ### How the Chroma sidecar fits
 
@@ -138,15 +129,15 @@ This keeps operational ownership in `DDP_backend`, which is the correct home for
 
 ### Stack decisions
 
-The backend app environment must support:
+After the latest `main` updates in `DDP_backend`, dbt and Elementary are no longer part of the backend app dependency set. They continue to run from the separate dbt execution environment.
 
-- `elementary-data==0.22.0`
-- `langgraph==0.0.69`
-- `chromadb==0.4.24`
-- `openai==1.55.3`
-- `onnxruntime==1.20.1`
+For this feature, the plan is:
 
-This is the required dependency line for the reviewed implementation. The important point is that LangGraph compatibility is solved inside the existing backend environment; we are not creating a separate runtime service for the chat agent.
+- keep dbt and Elementary in the separate dbt environment already used by Dalgo
+- add only chat-runtime dependencies to the backend app environment, specifically `langgraph`, `chromadb`, `openai`, and `onnxruntime`
+- invoke dbt artifact generation through the existing dbt environment rather than importing dbt packages into the main backend app runtime
+
+This keeps the backend app environment smaller and matches the current architecture on `main`.
 
 ---
 
@@ -171,7 +162,7 @@ class OrgPreferences(models.Model):
 
 Key choices:
 
-- We do **not** add an `ai_dashboard_chat_enabled` column here. Feature enablement remains in Dalgo’s existing feature flag system.
+- We do **not** add any new feature-enable column here. Feature availability continues to use Dalgo’s existing feature flag system, while account managers only control data-sharing consent.
 - `ai_data_sharing_consented_by` and `ai_data_sharing_consented_at` record the last affirmative consent action.
 - Org-level AI context does **not** live here. It moves to a dedicated table.
 
@@ -231,8 +222,6 @@ We extend `OrgDbt` with dbt artifact freshness and vector freshness metadata.
 
 ```python
 class OrgDbt(models.Model):
-    manifest_json = models.JSONField(null=True, blank=True)
-    catalog_json = models.JSONField(null=True, blank=True)
     docs_generated_at = models.DateTimeField(null=True, blank=True)
     vector_last_ingested_at = models.DateTimeField(null=True, blank=True)
 ```
@@ -240,36 +229,17 @@ class OrgDbt(models.Model):
 Key choices:
 
 - We use cleaned-up names because these fields are properties of the dbt project, not AI-specific state.
-- `manifest_json` and `catalog_json` store the latest successful dbt docs artifacts so targeted re-ingest can run without rerunning `dbt docs generate`.
-- Content digests for change detection are computed from these JSON values during ingestion; they do not need separate persisted hash columns in v1.
+- We do **not** store full dbt docs artifacts in SQL in v1.
 - `docs_generated_at` and `vector_last_ingested_at` remain the operational freshness markers exposed through the status/settings APIs.
 
 ### 3.5 New table: `DashboardChatSession`
 
 ```python
-class DashboardChatSessionStatus(str, Enum):
-    INITIALIZED = "initialized"
-    QUEUED = "queued"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
 class DashboardChatSession(models.Model):
     session_id = models.UUIDField(editable=False, unique=True, default=uuid.uuid4)
     org = models.ForeignKey(Org, on_delete=models.CASCADE)
     orguser = models.ForeignKey(OrgUser, null=True, on_delete=models.SET_NULL)
     dashboard = models.ForeignKey("ddpui.Dashboard", on_delete=models.SET_NULL, null=True)
-    selected_chart = models.ForeignKey(
-        "ddpui.Chart", on_delete=models.SET_NULL, null=True, blank=True
-    )
-    status = models.CharField(
-        max_length=50,
-        choices=DashboardChatSessionStatus.choices(),
-        default=DashboardChatSessionStatus.INITIALIZED,
-    )
-    feedback = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_created=True, default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -286,10 +256,9 @@ class DashboardChatSession(models.Model):
 
 Key choices:
 
-- Session-level status stays on the session row.
-- `selected_chart` stores the current/default chart context for the session and is updated whenever the user changes chart focus.
+- The session row stays minimal in v1. It exists to group messages by dashboard/user context, not to model a large session state machine.
 - Message history does **not** live in a JSON column on the session.
-- Chart focus is stored per message, not once at session level, because the user can change chart focus over time.
+- Chat is scoped to the dashboard as a whole in v1. We do not add chart-specific chat state.
 
 ### 3.6 New table: `DashboardChatMessage`
 
@@ -311,9 +280,6 @@ class DashboardChatMessage(models.Model):
         choices=DashboardChatMessageRole.choices(),
     )
     content = models.TextField(blank=True, default="")
-    selected_chart = models.ForeignKey(
-        "ddpui.Chart", on_delete=models.SET_NULL, null=True, blank=True
-    )
     client_message_id = models.CharField(max_length=100, null=True, blank=True)
     payload = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_created=True, default=timezone.now)
@@ -328,7 +294,7 @@ class DashboardChatMessage(models.Model):
         ]
 ```
 
-`payload` is used for structured assistant response data such as citations, related dashboards, warnings, SQL summary, usage, and graph trace.
+`payload` is used for structured assistant response data such as citations, related dashboards, warnings, and SQL summary.
 
 Example assistant-message payload:
 
@@ -337,20 +303,7 @@ Example assistant-message payload:
   "citations": [],
   "related_dashboards": [],
   "warnings": [],
-  "sql": "SELECT ...",
-  "sql_results": [],
-  "usage": {
-    "model": "gpt-4o-mini",
-    "input_tokens": 0,
-    "output_tokens": 0
-  },
-  "graph_trace": [
-    {
-      "node": "retrieve_docs",
-      "label": "Finding the right data sources",
-      "status": "completed"
-    }
-  ]
+  "sql": "SELECT ..."
 }
 ```
 
@@ -359,7 +312,7 @@ Key choices:
 - We use a normalized message table because storing an entire conversation in a session JSON column does not scale well.
 - The latest assistant response is simply the latest assistant message row. We do **not** duplicate it as a separate `latest_response` session field.
 - We do **not** keep a vague `request_meta` field on the session. Message-specific client IDs and assistant payloads are stored on the message row they belong to.
-- `graph_trace` is sanitized and safe for future UI display.
+- If we later want richer progress UI, it should be derived from coarse progress events rather than raw reasoning data.
 
 ---
 
@@ -580,7 +533,7 @@ Behavior:
 
 - requires `can_manage_org_settings`
 - updates `DashboardAIContext.markdown` and stamps editor metadata
-- marks the org as needing targeted re-ingest
+- change is picked up in the next scheduled context-build run
 
 ### 5.3 Chat websocket contract
 
@@ -600,31 +553,26 @@ The chat websocket follows Dalgo’s existing authenticated consumer pattern:
 
 Client actions sent over the websocket:
 
-- `start_session`
 - `send_message`
-- `resume_session`
 
-#### `start_session`
+#### `send_message`
 
 ```json
 {
-  "action": "start_session",
-  "selected_chart_id": 128
+  "action": "send_message",
+  "message": "Why did donor funding drop this quarter?",
+  "client_message_id": "ui-1742206800-1"
 }
 ```
 
-Server response:
+For later turns on the same page, the frontend includes the returned session ID:
 
 ```json
 {
-  "event_type": "session_started",
+  "action": "send_message",
   "session_id": "0d1d77b7-6d52-4a9a-b8a7-5a9c6e3f1b62",
-  "dashboard_id": 42,
-  "occurred_at": "2026-03-17T10:20:00Z",
-  "data": {
-    "status": "initialized",
-    "selected_chart_id": 128
-  }
+  "message": "Can you break that down by donor type?",
+  "client_message_id": "ui-1742206800-2"
 }
 ```
 
@@ -632,97 +580,15 @@ Validation:
 
 - requires dashboard access
 - org must have `AI_DASHBOARD_CHAT` enabled
-- if `selected_chart_id` is provided, it must belong to the dashboard
-- the consumer stores `selected_chart_id` on `DashboardChatSession.selected_chart` as the default chart context for the session
-
-#### `send_message`
-
-```json
-{
-  "action": "send_message",
-  "session_id": "0d1d77b7-6d52-4a9a-b8a7-5a9c6e3f1b62",
-  "message": "Why did donor funding drop this quarter?",
-  "selected_chart_id": 128,
-  "client_message_id": "ui-1742206800-1"
-}
-```
-
-Immediate server acknowledgement:
-
-```json
-{
-  "event_type": "queued",
-  "session_id": "0d1d77b7-6d52-4a9a-b8a7-5a9c6e3f1b62",
-  "dashboard_id": 42,
-  "message_id": "a939f3cb-1b07-47ae-b4d5-a0c31eaf3f8d",
-  "occurred_at": "2026-03-17T10:21:00Z",
-  "data": {
-    "status": "queued"
-  }
-}
-```
-
-Validation:
-
-- session must belong to the current org and dashboard
-- selected chart, if provided, must belong to the same dashboard
-- if org is not ready for chat, respond with an `error` event and do not enqueue work
-- if `selected_chart_id` is provided, the backend stores it on both `DashboardChatMessage.selected_chart` and `DashboardChatSession.selected_chart`
-
-#### `resume_session`
-
-```json
-{
-  "action": "resume_session",
-  "session_id": "0d1d77b7-6d52-4a9a-b8a7-5a9c6e3f1b62"
-}
-```
-
-Server response:
-
-```json
-{
-  "event_type": "session_started",
-  "session_id": "0d1d77b7-6d52-4a9a-b8a7-5a9c6e3f1b62",
-  "dashboard_id": 42,
-  "occurred_at": "2026-03-17T10:22:00Z",
-  "data": {
-    "status": "completed",
-    "selected_chart_id": 128,
-    "messages": [
-      {
-        "id": "a939f3cb-1b07-47ae-b4d5-a0c31eaf3f8d",
-        "role": "user",
-        "content": "Why did donor funding drop this quarter?",
-        "selected_chart_id": 128,
-        "created_at": "2026-03-17T10:21:00Z",
-        "payload": null
-      },
-      {
-        "id": "ffd4d3eb-d80a-4c0d-b9db-c531b999b55c",
-        "role": "assistant",
-        "content": "...",
-        "selected_chart_id": 128,
-        "created_at": "2026-03-17T10:21:12Z",
-        "payload": {
-          "citations": [],
-          "related_dashboards": [],
-          "warnings": [],
-          "sql": "SELECT ..."
-        }
-      }
-    ]
-  }
-}
-```
+- if `session_id` is omitted, backend creates a new `DashboardChatSession`
+- if `session_id` is provided, it must belong to the current org and dashboard
+- if org is not ready for chat, respond with an `error` event and do not start processing
 
 Server events emitted after `send_message`:
 
-- `queued`
 - `progress`
 - `assistant_message`
 - `error`
-- `done`
 
 Example `progress` event:
 
@@ -734,9 +600,7 @@ Example `progress` event:
   "message_id": "a939f3cb-1b07-47ae-b4d5-a0c31eaf3f8d",
   "occurred_at": "2026-03-17T10:21:04Z",
   "data": {
-    "label": "Finding the right data sources",
-    "node": "retrieve_docs",
-    "status": "completed"
+    "label": "thinking"
   }
 }
 ```
@@ -753,7 +617,6 @@ Example `assistant_message` event:
   "data": {
     "role": "assistant",
     "content": "...",
-    "selected_chart_id": 128,
     "payload": {
       "citations": [],
       "related_dashboards": [],
@@ -764,7 +627,7 @@ Example `assistant_message` event:
 }
 ```
 
-`progress` labels are sanitized and safe for eventual user display.
+`progress` is intentionally minimal in v1 and always uses the user-safe label `thinking`.
 
 ### 5.4 No dedicated chat webhook in v1
 
@@ -887,25 +750,16 @@ The settings page must include:
 
 ### Dashboard chat UI
 
-Reuse the useful shell/layout ideas from frontend PR `#162`, but replace the transport completely.
+Reuse the useful shell/layout ideas from frontend PR `#162`, but replace the transport completely. Reuse from backend PR `#1199` is limited to any useful settings, permission, and feature-flag patterns; do not reuse its chat runtime or transport design.
 
 The UI flow is:
 
 - open authenticated dashboard-chat websocket
-- send `start_session`
 - send `send_message` for each user turn
-- send `resume_session` after reconnect or reload
+- let the backend create the session implicitly on the first turn
+- reuse the returned `session_id` for later turns on the same page
 - listen for websocket events and update the panel state
-
-### Chart focus
-
-`DashboardNativeView` needs explicit selected-chart state.
-
-This state is used for:
-
-- carrying `selected_chart_id` into session/message requests
-- prioritizing relevant chart context in the runtime
-- showing in the chat panel that the user is asking about a specific chart
+- a full page refresh starts a new chat session in v1
 
 ### Public dashboards
 
@@ -933,19 +787,19 @@ Public/shared dashboards do not get chat in v1.
 ### Phase 3: Scheduled freshness
 
 - 3-hour beat task
-- one org-specific ingest job per org
+- one org-specific context-build job per org
 - per-org lock to prevent concurrent rebuilds
-- targeted re-ingest for context changes
+- context changes are incorporated by the next scheduled run
 - failure handling that preserves last good vector state
 
 ### Phase 4: Chat transport and orchestration
 
 - websocket consumer
-- websocket action handling for `start_session`, `send_message`, and `resume_session`
+- websocket action handling for `send_message`
 - async worker execution
 - LangGraph runtime integration
 - message persistence using `DashboardChatMessage`
-- safe graph trace persistence
+- one minimal progress event label: `thinking`
 
 ### Phase 5: Frontend integration
 
@@ -955,8 +809,7 @@ Public/shared dashboards do not get chat in v1.
 - context editors
 - chat panel
 - websocket client
-- chart focus integration
-- session recovery
+- fresh session on page load
 
 ### Phase 6: Hardening
 
@@ -993,7 +846,6 @@ Owns:
 - context editors
 - dashboard chat UI
 - websocket client
-- chart focus state
 
 ### `prefect-proxy`
 
@@ -1021,7 +873,7 @@ No code changes in v1.
   - citation payload shape
   - cross-dashboard suggestions
 - websocket auth and event-ordering tests
-- websocket action tests for `start_session`, `send_message`, and `resume_session`
+- websocket action tests for `send_message`
 
 ### Frontend
 
@@ -1032,8 +884,7 @@ No code changes in v1.
 - dashboard context save
 - websocket happy path
 - websocket error path
-- selected-chart propagation
-- session reload recovery
+- page refresh starts a new session
 
 ### End-to-end
 
@@ -1059,4 +910,4 @@ No code changes in v1.
 
 **9.0 / 10**
 
-The main remaining risk is operational hardening around scheduled dbt refresh failures and websocket/session recovery, but the architecture, schema, and API decisions are consistent and implementation-ready.
+The main remaining risk is operational hardening around scheduled dbt refresh failures and websocket behavior under failure/reconnect conditions, but the architecture, schema, and API decisions are consistent and implementation-ready.
