@@ -21,13 +21,26 @@ Frontend (webapp_v2)                          Backend (DDP_backend)
 
 **Key principle**: API → Core Service → Models (one-way dependency). The API layer is thin — it validates via Pydantic schemas, checks permissions, calls the service, and wraps responses.
 
-**Targeting model**: Comments are scoped to a **report snapshot** (`ReportSnapshot`). Each comment targets either the `report` (executive summary level) or a specific `chart` (by `snapshot_chart_id`). This is a flat comment model — no threading or nesting.
+**Targeting model**: Comments are scoped to a **report snapshot** (`ReportSnapshot`). Each comment targets either the `summary` (executive summary level) or a specific `chart` (by `snapshot_chart_id`). This is a flat comment model — no threading or nesting.
+
+**Target types** are managed via an application-level enum (`CommentTargetType`) — NOT via Django model `choices`. This avoids unnecessary migrations when adding new target types.
 
 ---
 
 ## Database Models (`ddpui/models/comment.py`)
 
-Three models:
+### `CommentTargetType` (Application-level enum)
+
+```python
+class CommentTargetType:
+    CHART = "chart"
+    SUMMARY = "summary"
+    ALL = [CHART, SUMMARY]
+```
+
+**Note**: This is NOT a Django enum. It's a plain class used for validation in the service layer. The `target_type` CharField has NO `choices=` parameter, so adding new target types doesn't require a migration.
+
+Two models:
 
 ### `Comment`
 
@@ -36,37 +49,19 @@ The core comment record.
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | `BigAutoField` | Primary key |
-| `target_type` | `CharField(max_length=20)` | `"dashboard"`, `"chart"`, or `"report"` (choices) |
-| `dashboard` | `ForeignKey(Dashboard)` | Nullable, for dashboard-level comments (legacy) |
-| `chart` | `ForeignKey(Chart)` | Nullable, for chart-level comments (legacy) |
+| `target_type` | `CharField(max_length=20)` | `"chart"` or `"summary"` (no DB-level choices) |
 | `snapshot` | `ForeignKey(ReportSnapshot)` | Nullable, for report snapshot comments |
 | `snapshot_chart_id` | `IntegerField` | Nullable. Chart ID within `frozen_chart_configs` (NOT a FK) |
 | `content` | `TextField` | Comment text body (max 5000 chars enforced at schema level) |
-| `parent_comment` | `ForeignKey("self")` | Nullable, for threading (not used in reports) |
+| `mentioned_emails` | `JSONField` | Default `[]`. List of email addresses mentioned in this comment |
 | `author` | `ForeignKey(OrgUser)` | Comment author |
 | `org` | `ForeignKey(Org)` | Multi-tenant isolation |
-| `is_edited` | `BooleanField` | Default `False` |
-| `is_deleted` | `BooleanField` | Default `False` (soft delete) |
-| `deleted_at` | `DateTimeField` | Nullable, set on soft delete |
 | `created_at` | `DateTimeField` | Auto-set on creation |
 | `updated_at` | `DateTimeField` | Auto-set on every save |
 
-**Indexes**: `(dashboard, created_at)`, `(chart, created_at)`, `(parent_comment, created_at)`, `(org, created_at)`
+**Indexes**: `(org, created_at)`
 
-**For report comments**, only these fields are used: `target_type` (set to `"report"` or `"chart"`), `snapshot`, `snapshot_chart_id`, `content`, `author`, `org`, timestamps, and soft-delete fields.
-
-### `CommentMention`
-
-Tracks @mentions within a comment.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `BigAutoField` | Primary key |
-| `comment` | `ForeignKey(Comment)` | The comment containing the mention |
-| `mentioned_user` | `ForeignKey(OrgUser)` | The mentioned user |
-| `created_at` | `DateTimeField` | Auto-set |
-
-**Constraints**: `unique_together = [("comment", "mentioned_user")]`
+**Behavioral notes**: Mentions are stored as a JSON list of email strings instead of a separate table. Deletes are hard deletes (row removed).
 
 ### `CommentReadStatus`
 
@@ -77,7 +72,7 @@ Tracks per-user read state for each comment target on a report. `last_read_at` i
 | `id` | `BigAutoField` | Primary key |
 | `user` | `ForeignKey(OrgUser)` | The user |
 | `snapshot` | `ForeignKey(ReportSnapshot)` | The report snapshot |
-| `target_type` | `CharField(max_length=20)` | `"report"` or `"chart"` |
+| `target_type` | `CharField(max_length=20)` | `"summary"` or `"chart"` (no DB-level choices) |
 | `chart_id` | `IntegerField` | Nullable. Chart ID within frozen_chart_configs (for chart-level read status) |
 | `last_read_at` | `DateTimeField` | When the user last read this target's comments |
 
@@ -96,7 +91,7 @@ Tracks per-user read state for each comment target on a report. `last_read_at` i
 | Field | Type | Required | Constraints | Description |
 |-------|------|----------|-------------|-------------|
 | `snapshot_id` | `int` | Yes | — | ReportSnapshot ID |
-| `target_type` | `str` | Yes | `"report"` or `"chart"` | What the comment is attached to |
+| `target_type` | `str` | Yes | `"summary"` or `"chart"` | What the comment is attached to |
 | `chart_id` | `int \| null` | No | Required when `target_type="chart"` | Chart ID within frozen_chart_configs |
 | `content` | `str` | Yes | min 1, max 5000 chars | Comment text body (may contain @email mentions) |
 
@@ -126,13 +121,13 @@ Tracks per-user read state for each comment target on a report. `last_read_at` i
 | Field | Type | Required | Constraints | Description |
 |-------|------|----------|-------------|-------------|
 | `snapshot_id` | `int` | Yes | — | ReportSnapshot ID |
-| `target_type` | `str` | Yes | `"report"` or `"chart"` | Which target to mark read |
+| `target_type` | `str` | Yes | `"summary"` or `"chart"` | Which target to mark read |
 | `chart_id` | `int \| null` | No | Required when `target_type="chart"` | Chart ID within snapshot |
 
 ```json
 {
   "snapshot_id": 42,
-  "target_type": "report"
+  "target_type": "summary"
 }
 ```
 
@@ -167,13 +162,11 @@ Tracks per-user read state for each comment target on a report. `last_read_at` i
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | `int` | Comment primary key |
-| `target_type` | `str` | `"report"` or `"chart"` |
+| `target_type` | `str` | `"summary"` or `"chart"` |
 | `snapshot_id` | `int` | ReportSnapshot ID |
 | `chart_id` | `int \| null` | Chart ID within frozen_chart_configs (null for report-level) |
 | `content` | `str` | Comment text body |
 | `author` | `CommentAuthorResponse` | Author email and name |
-| `is_edited` | `bool` | Whether the comment has been edited |
-| `is_deleted` | `bool` | Whether the comment is soft-deleted |
 | `is_new` | `bool` | Whether this comment is unread by the requesting user (computed from `CommentReadStatus.last_read_at`) |
 | `created_at` | `datetime` | ISO-8601 creation timestamp |
 | `updated_at` | `datetime` | ISO-8601 last update timestamp |
@@ -184,7 +177,7 @@ Tracks per-user read state for each comment target on a report. `last_read_at` i
 - `author.name` ← `_get_user_name(comment.author)`
 - `chart_id` ← `comment.snapshot_chart_id`
 - `is_new` ← `getattr(comment, "is_new", False)` (set by service layer)
-- `mentions` ← `comment.mentions.all()` (prefetched)
+- `mentions` ← resolved from `comment.mentioned_emails` JSONField (batch-resolved in service layer)
 
 ```json
 {
@@ -197,8 +190,6 @@ Tracks per-user read state for each comment target on a report. `last_read_at` i
     "email": "noopur@projecttech4dev.org",
     "name": "Noopur Raval"
   },
-  "is_edited": false,
-  "is_deleted": false,
   "is_new": true,
   "created_at": "2026-03-13T10:30:00Z",
   "updated_at": "2026-03-13T10:30:00Z",
@@ -213,20 +204,21 @@ Tracks per-user read state for each comment target on a report. `last_read_at` i
 | Field | Type | Description |
 |-------|------|-------------|
 | `state` | `str` | One of: `"none"`, `"unread"`, `"read"`, `"mentioned"` |
-| `count` | `int` | Number of unread comments for this target |
+| `count` | `int` | Total number of comments for this target |
+| `unread_count` | `int` | Number of unread comments for this target |
 
 #### `CommentStatesResponse` — returned by `GET /api/comments/states/`
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `states` | `Dict[str, CommentStateEntry]` | Map of target key → state+count. Key is `"report"` for report-level, or the chart_id as a string (e.g., `"7"`) for chart-level |
+| `states` | `Dict[str, CommentStateEntry]` | Map of target key → state+counts. Key is `"summary"` for summary-level, or the chart_id as a string (e.g., `"7"`) for chart-level |
 
 ```json
 {
   "states": {
-    "report": { "state": "read", "count": 0 },
-    "7": { "state": "mentioned", "count": 3 },
-    "12": { "state": "unread", "count": 1 }
+    "summary": { "state": "read", "count": 3, "unread_count": 0 },
+    "7": { "state": "mentioned", "count": 5, "unread_count": 3 },
+    "12": { "state": "unread", "count": 2, "unread_count": 1 }
   }
 }
 ```
@@ -285,7 +277,7 @@ Returns icon states for all targets in a snapshot (for badge rendering).
   "success": true,
   "data": {
     "states": {
-      "report": { "state": "read", "count": 0 },
+      "summary": { "state": "read", "count": 0 },
       "7": { "state": "mentioned", "count": 3 }
     }
   }
@@ -340,7 +332,7 @@ Lists all non-deleted comments for a target, ordered chronologically by `created
 
 **Query params**:
 - `snapshot_id` (int, required)
-- `target_type` (str, required): `"report"` or `"chart"`
+- `target_type` (str, required): `"summary"` or `"chart"`
 - `chart_id` (int, optional): required when `target_type="chart"`
 
 **Response**: `ApiResponse<CommentResponse[]>`
@@ -355,8 +347,6 @@ Lists all non-deleted comments for a target, ordered chronologically by `created
       "chart_id": 7,
       "content": "Great progress here",
       "author": { "email": "admin@org.com", "name": null },
-      "is_edited": false,
-      "is_deleted": false,
       "is_new": false,
       "created_at": "2026-03-11T08:00:00Z",
       "updated_at": "2026-03-11T08:00:00Z",
@@ -369,8 +359,6 @@ Lists all non-deleted comments for a target, ordered chronologically by `created
       "chart_id": 7,
       "content": "This number looks off @siddhant@dalgo.in",
       "author": { "email": "noopur@projecttech4dev.org", "name": "Noopur Raval" },
-      "is_edited": false,
-      "is_deleted": false,
       "is_new": true,
       "created_at": "2026-03-13T10:30:00Z",
       "updated_at": "2026-03-13T10:30:00Z",
@@ -422,7 +410,7 @@ Creates a new comment.
 
 **Side effects**:
 - `MentionService.process_mentions()` parses @email mentions from content
-- Creates `CommentMention` records for each detected org user
+- Stores mentioned emails in `Comment.mentioned_emails` JSONField
 - Creates `Notification` + `NotificationRecipient` records
 
 **Errors**: 400 (invalid target_type, missing chart_id, chart not in snapshot's `frozen_chart_configs`), 500 (unexpected)
@@ -448,13 +436,12 @@ Updates a comment's content. Author-only.
   "data": {
     "id": 15,
     "content": "Updated: this number is correct now",
-    "is_edited": true,
     "..."
   }
 }
 ```
 
-**Side effects**: Deletes all old `CommentMention` records for this comment, then re-runs `MentionService.process_mentions()` on the new content.
+**Side effects**: Clears `mentioned_emails`, then re-runs `MentionService.process_mentions()` on the new content.
 
 **Errors**: 404 (not found or deleted), 403 (not the author)
 
@@ -462,7 +449,7 @@ Updates a comment's content. Author-only.
 
 ### `DELETE /api/comments/{comment_id}/`
 
-Soft-deletes a comment. Author-only. Sets `is_deleted=True` and `deleted_at=now()`.
+Hard-deletes a comment. Author-only. The row is permanently removed.
 
 **Path params**: `comment_id` (int)
 
@@ -473,7 +460,7 @@ Soft-deletes a comment. Author-only. Sets `is_deleted=True` and `deleted_at=now(
 { "success": true, "message": "Comment deleted" }
 ```
 
-**Errors**: 404 (not found or already deleted), 403 (not the author)
+**Errors**: 404 (not found), 403 (not the author)
 
 ---
 
@@ -485,18 +472,18 @@ Static methods on `CommentService` class:
 |--------|---------|
 | `list_comments(snapshot_id, org, target_type, chart_id, orguser)` | Flat chronological list with `is_new` annotation based on `CommentReadStatus.last_read_at` |
 | `create_comment(snapshot_id, org, orguser, target_type, content, chart_id)` | Validates target, creates comment, delegates to `MentionService.process_mentions()` |
-| `update_comment(comment_id, org, orguser, content)` | Author-only, sets `is_edited=True`, re-processes mentions |
-| `delete_comment(comment_id, org, orguser)` | Author-only soft delete |
+| `update_comment(comment_id, org, orguser, content)` | Author-only, clears and re-processes mentions |
+| `delete_comment(comment_id, org, orguser)` | Author-only hard delete |
 | `get_comment_states(snapshot_id, org, orguser)` | Returns icon state + unread count per target |
 | `mark_as_read(snapshot_id, org, orguser, target_type, chart_id)` | Upserts `CommentReadStatus` with `last_read_at = now()` |
 | `get_mentionable_users(org)` | Returns all OrgUsers in the org, ordered by email |
 
 ### Icon state computation (`get_comment_states`)
 
-1. Fetches all non-deleted comments for the snapshot (values: `target_type`, `snapshot_chart_id`, `created_at`, `id`)
+1. Fetches all comments for the snapshot (values: `target_type`, `snapshot_chart_id`, `created_at`, `id`)
 2. Fetches all `CommentReadStatus` entries for the user on this snapshot
-3. Fetches all `CommentMention` IDs where `mentioned_user=orguser` on this snapshot
-4. Groups comments by target key (`"report"` or `str(chart_id)`)
+3. Queries comments where `mentioned_emails__contains=[user_email]` to find mentioned comment IDs
+4. Groups comments by target key (`CommentTargetType.SUMMARY` or `str(chart_id)`). Skips entries where `target_type="chart"` but `chart_id is None` (invalid data).
 5. For each target:
    - Counts unread comments (`created_at > last_read_at`, or all if no read status)
    - Checks if any unread comment ID is in the mentioned set
@@ -506,7 +493,7 @@ Static methods on `CommentService` class:
 
 - Regex: `r'@([\w.+-]+@[\w.-]+\.\w+)'`
 - Resolves each email to an `OrgUser` in the same org
-- Creates `CommentMention` records (ignores unknown emails silently)
+- Stores matched emails in `Comment.mentioned_emails` JSONField (ignores unknown emails silently)
 - Creates `Notification` + `NotificationRecipient` records for each mentioned user
 
 ### Exceptions (`ddpui/core/comments/exceptions.py`)
@@ -539,13 +526,11 @@ export interface CommentMention {
 // Core comment object (matches CommentResponse from backend)
 export interface Comment {
   id: number;
-  target_type: 'report' | 'chart';
+  target_type: 'summary' | 'chart';
   snapshot_id: number;
   chart_id?: number;
   content: string;
   author: CommentAuthor;
-  is_edited: boolean;
-  is_deleted: boolean;
   is_new: boolean;
   created_at: string;
   updated_at: string;
@@ -558,12 +543,13 @@ export type CommentIconState = 'none' | 'unread' | 'read' | 'mentioned';
 // Per-target state entry
 export interface CommentStateEntry {
   state: CommentIconState;
-  count: number;
+  count: number;        // total number of comments
+  unread_count: number; // number of unread comments
 }
 
 // Map of all target states for a snapshot
 export interface CommentStates {
-  [key: string]: CommentStateEntry; // "report" or chart_id string → { state, count }
+  [key: string]: CommentStateEntry; // "summary" or chart_id string → { state, count, unread_count }
 }
 
 // Mentionable user for @mention dropdown
@@ -575,14 +561,14 @@ export interface MentionableUser {
 // Mutation payloads
 export interface CreateCommentPayload {
   snapshot_id: number;
-  target_type: 'report' | 'chart';
+  target_type: 'summary' | 'chart';
   chart_id?: number;
   content: string;
 }
 
 export interface MarkReadPayload {
   snapshot_id: number;
-  target_type: 'report' | 'chart';
+  target_type: 'summary' | 'chart';
   chart_id?: number;
 }
 ```
@@ -660,16 +646,18 @@ SWR hooks extract `data?.data` (the inner payload) when returning values.
 
 ### CommentIcon (`components/reports/comment-icon.tsx`)
 
-Renders the trigger icon based on `CommentIconState`:
+Renders the trigger icon based on `CommentIconState` and `unreadCount`:
 
 | State | Icon | Indicator |
 |-------|------|-----------|
 | `none` | `MessageCircle` outline | None |
-| `read` | `MessageCircle` outline | Small outline dot (top-right, `border-muted-foreground`) |
-| `unread` | `MessageCircle` outline | Filled `bg-rose-500` dot, OR `bg-rose-500` count badge if `count > 0` |
-| `mentioned` | `AtSign` icon | `bg-rose-500` count badge if `count > 0` |
+| `read` | `MessageCircle` outline | Small outline dot (top-right, `border-muted-foreground`) — only shown when no unread badge |
+| `unread` | `MessageCircle` outline | `bg-rose-500` count badge showing `unreadCount` |
+| `mentioned` | `AtSign` icon | `bg-rose-500` count badge showing `unreadCount` |
 
-Badge: `min-w-[16px] h-4 rounded-full bg-rose-500 text-[10px] text-white`. Shows `99+` for count > 99.
+**Props**: `state: CommentIconState`, `unreadCount?: number` (default 0), `className?: string`
+
+Badge: `min-w-[16px] h-4 rounded-full bg-rose-500 text-[10px] text-white`. Shows `99+` for count > 99. Only shown when `unreadCount > 0`.
 Icons: `h-4 w-4`.
 
 ### CommentPopover (`components/reports/comment-popover.tsx`)
@@ -680,10 +668,10 @@ Radix `Popover` with Figma-based redesign.
 ```typescript
 interface CommentPopoverProps {
   snapshotId: number;
-  targetType: 'report' | 'chart';
+  targetType: 'summary' | 'chart';
   chartId?: number;
   state: CommentIconState;
-  count?: number;
+  unreadCount?: number;
   triggerClassName?: string;
   onStateChange?: () => void;
 }
@@ -718,17 +706,28 @@ interface CommentPopoverProps {
 
 ## Integration Points
 
-### Report header (`app/reports/[snapshotId]/page.tsx`)
+### Executive Summary section (`app/reports/[snapshotId]/page.tsx`)
+
+The comment popover is placed next to the "Executive Summary" heading inside the `beforeContent` section (not in the report header).
 
 ```tsx
-<CommentPopover
-  snapshotId={snapshotId}
-  targetType="report"
-  state={commentStates?.['report']?.state ?? 'none'}
-  count={commentStates?.['report']?.count ?? 0}
-  triggerClassName="h-9 w-9"
-  onStateChange={handleCommentStateChange}
-/>
+beforeContent={
+  <div className="border rounded-lg p-5 mb-2 bg-background">
+    <div className="flex items-center justify-between mb-2">
+      <h2 className="text-lg font-semibold">Executive Summary</h2>
+      <CommentPopover
+        snapshotId={snapshotId}
+        targetType="summary"
+        state={commentStates?.['summary']?.state ?? 'none'}
+        count={commentStates?.['summary']?.count ?? 0}
+        unreadCount={commentStates?.['summary']?.unread_count ?? 0}
+        triggerClassName="h-8 w-8"
+        onStateChange={handleCommentStateChange}
+      />
+    </div>
+    <Textarea ... />
+  </div>
+}
 ```
 
 ### Chart cards (`components/dashboard/chart-element-view.tsx`)
@@ -741,6 +740,7 @@ interface CommentPopoverProps {
     chartId={chartId}
     state={(commentStates?.[String(chartId)]?.state as CommentIconState) ?? 'none'}
     count={commentStates?.[String(chartId)]?.count ?? 0}
+    unreadCount={commentStates?.[String(chartId)]?.unread_count ?? 0}
     triggerClassName="h-7 w-7 p-0"
     onStateChange={onCommentStateChange}
   />
@@ -783,8 +783,8 @@ Pass `null` as the snapshot ID to `useComments` when the popover is closed: `use
 ### 4. Popover Interaction with Dropdowns
 The `onInteractOutside` handler on `PopoverContent` prevents closing when clicking inside the mention dropdown by checking `target.closest('[data-testid="mention-dropdown"]')`.
 
-### 5. Soft Delete Display
-Deleted comments show "This comment has been deleted." in italic muted text. The backend filters by `is_deleted=False`, so deleted comments are not returned in list queries.
+### 5. Hard Delete
+Comments are permanently removed from the database on delete. No soft-delete mechanism.
 
 ### 6. Multi-Tenant Isolation
 Every backend query includes `org=org`. The org comes from `request.orguser.org` in the API layer.
@@ -793,7 +793,19 @@ Every backend query includes `org=org`. The org comes from `request.orguser.org`
 When creating a chart comment, the service validates that `str(chart_id)` exists as a key in the snapshot's `frozen_chart_configs` dict.
 
 ### 8. Read Status Per Target
-`CommentReadStatus` tracks `last_read_at` per `(user, snapshot, target_type, chart_id)`. Read state is independent between report-level comments and each chart's comments.
+`CommentReadStatus` tracks `last_read_at` per `(user, snapshot, target_type, chart_id)`. Read state is independent between summary-level comments and each chart's comments.
+
+### 9. Cookie Auth for Local Dev
+For local development with cookie-based auth, these settings must be correct in `DDP_backend/ddpui/settings.py`:
+- `COOKIE_SECURE = False` (browsers reject `Secure` cookies on HTTP)
+- `COOKIE_SAMESITE = "Lax"` (`None` requires `Secure=True`)
+- Frontend `NEXT_PUBLIC_BACKEND_URL` must use `http://localhost:8002` (NOT `127.0.0.1` — different origins break cookie sending)
+
+### 10. Application-Level Target Type Enum
+`CommentTargetType` is a plain Python class, NOT a Django enum or model `choices`. This means adding new target types (e.g., `"kpi"`) requires NO migration — just add to the class and update the service layer validation.
+
+### 11. Null Chart ID Guard in get_comment_states
+When grouping comments by target in `get_comment_states`, always check `chart_id is not None` before converting to string key. Old or invalid data may have `target_type="chart"` with `snapshot_chart_id=None`, which would cause `int("None")` crash.
 
 ---
 
@@ -802,7 +814,7 @@ When creating a chart comment, the service validates that `str(chart_id)` exists
 ### Backend — Created
 | File | Purpose |
 |------|---------|
-| `ddpui/models/comment.py` | Comment, CommentMention, CommentReadStatus models |
+| `ddpui/models/comment.py` | Comment, CommentReadStatus models |
 | `ddpui/core/comments/__init__.py` | Public exports |
 | `ddpui/core/comments/comment_service.py` | CRUD, icon states, mark-as-read, mentionable users |
 | `ddpui/core/comments/mention_service.py` | @mention parsing, notification dispatch |
@@ -828,8 +840,61 @@ When creating a chart comment, the service validates that `str(chart_id)` exists
 |------|--------|
 | `components/reports/utils.ts` | Added `formatCommentTime`, `getAvatarColor`, `getInitials`, `parseCommentMentions` |
 | `components/dashboard/chart-element-view.tsx` | Added `<CommentPopover>` to chart toolbar (report mode only) |
-| `app/reports/[snapshotId]/page.tsx` | Added report-level `<CommentPopover>` in header, `useCommentStates` hook |
+| `app/reports/[snapshotId]/page.tsx` | Added summary-level `<CommentPopover>` in Executive Summary `beforeContent` section, `useCommentStates` hook |
 | `components/dashboard/dashboard-native-view.tsx` | Passes `snapshotId`, `commentStates`, `onCommentStateChange` to chart views |
+
+---
+
+## Migration
+
+A single consolidated migration `0154_commentreadstatus_comment_and_more.py` creates both `Comment` and `CommentReadStatus` tables. It has no `choices=` on `target_type` fields (matching the model). Dependencies: `("ddpui", "0153_merge_20260314_1816")`.
+
+**History**: Originally there were 3 separate migrations (0154, 0155, 0156) that were consolidated into this single migration during development.
+
+---
+
+## @Mention Notification Flow
+
+When a user is @mentioned in a comment, here's the full end-to-end notification flow:
+
+### 1. Comment Created → Mentions Parsed (`MentionService.process_mentions`)
+- Extracts email patterns using regex: `@([\w.+-]+@[\w.-]+\.\w+)`
+- Resolves each email to an `OrgUser` in the same org
+- Stores matched emails in `Comment.mentioned_emails` JSONField
+- Ignores unknown emails silently
+
+### 2. Notification Created & Delivered (`MentionService.send_mention_notifications`)
+- Creates a `Notification` record with message like *"user@example.com mentioned you in a comment..."*
+- Creates `NotificationRecipient` records for each mentioned user (excluding the author)
+- **Email via AWS SES**: Sent immediately (synchronous) if `UserPreferences.enable_email_notifications` is enabled
+- **Discord webhook**: Sent if `OrgPreferences.enable_discord_notifications` is enabled and webhook URL is configured
+
+### 3. Frontend Notification Display
+- Frontend polls `GET /api/notifications/unread_count` every 30 seconds via SWR (`useUnreadCount` hook)
+- Users see notifications in the **Notifications page** (`/notifications`)
+- The comment icon changes to `AtSign` with "mentioned" state when there are unread mentions
+
+### Key Backend Files for Notifications
+| File | Purpose |
+|------|---------|
+| `ddpui/core/comments/mention_service.py` | @mention parsing, notification dispatch |
+| `ddpui/core/notifications/notifications_functions.py` | Notification creation & email/discord delivery |
+| `ddpui/models/notifications.py` | `Notification` and `NotificationRecipient` models |
+| `ddpui/api/notifications_api.py` | Notification list, unread count, mark-read endpoints |
+
+### Key Frontend Files for Notifications
+| File | Purpose |
+|------|---------|
+| `hooks/api/useNotifications.ts` | SWR hooks for notifications + unread count (30s polling) |
+| `types/notifications.ts` | TypeScript interfaces |
+| `components/notifications/NotificationsList.tsx` | Notification list with pagination |
+| `components/notifications/NotificationRow.tsx` | Individual notification display |
+
+### Limitations
+- **No real-time push**: Uses 30-second polling, not WebSockets
+- **Email delivery is synchronous**: Happens immediately when comment is created (not queued via Celery)
+- **Email-based mentions only**: Must use `@user@example.com` format, not `@username`
+- **No per-feature notification preferences**: Only global email/discord toggle
 
 ---
 
