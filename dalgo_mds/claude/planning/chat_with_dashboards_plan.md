@@ -397,7 +397,9 @@ V1 keeps source-type enablement as backend runtime configuration rather than a p
 
 ## 5. API Design
 
-All success responses use Dalgo’s standard envelope:
+Response shapes follow the conventions of the existing router they live under.
+
+- `orgpreferences` endpoints use Dalgo’s standard success envelope:
 
 ```json
 {
@@ -405,6 +407,8 @@ All success responses use Dalgo’s standard envelope:
   "res": {}
 }
 ```
+
+- native dashboard endpoints follow the existing `dashboard_native_api` convention and return the typed payload directly instead of wrapping it in a success envelope
 
 ### 5.1 Org settings APIs
 
@@ -507,15 +511,12 @@ Response:
 
 ```json
 {
-  "success": true,
-  "res": {
-    "dashboard_id": 17,
-    "dashboard_title": "Donor Report",
-    "dashboard_context_markdown": "## Dashboard context ...",
-    "dashboard_context_updated_by": "manager@org.org",
-    "dashboard_context_updated_at": "2026-03-17T10:16:00Z",
-    "vector_last_ingested_at": "2026-03-17T09:05:00Z"
-  }
+  "dashboard_id": 17,
+  "dashboard_title": "Donor Report",
+  "dashboard_context_markdown": "## Dashboard context ...",
+  "dashboard_context_updated_by": "manager@org.org",
+  "dashboard_context_updated_at": "2026-03-17T10:16:00Z",
+  "vector_last_ingested_at": "2026-03-17T09:05:00Z"
 }
 ```
 
