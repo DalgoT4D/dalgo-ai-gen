@@ -232,6 +232,278 @@ In preview (view) mode, the system checks how many tabs exist. If only 1 tab, th
 
 ---
 
+## Architecture Decision: Data Structure Analysis
+
+This section documents the technical analysis performed to select the optimal data structure for the tabs feature.
+
+### Approaches Considered
+
+**Approach 1: Data Inside Tabs**
+```json
+{
+  "layout_config": [],
+  "components": {},
+  "tabs": {
+    "tabs": [
+      {
+        "id": "tab-1",
+        "title": "Tab 1",
+        "order": 0,
+        "layout_config": [{ "i": "chart-123", "x": 0, "y": 0, "w": 6, "h": 4 }],
+        "components": { "chart-123": { "type": "chart", "config": { "chartId": 1 } } }
+      }
+    ],
+    "activeTabId": "tab-1"
+  }
+}
+```
+
+**Approach 2: Children Array (Superset-style)**
+```json
+{
+  "layout_config": [{ "i": "chart-123", "x": 0, "y": 0, "w": 6, "h": 4 }],
+  "components": { "chart-123": { "type": "chart", "config": { "chartId": 1 } } },
+  "tabs": {
+    "tabs": [
+      { "id": "tab-1", "title": "Tab 1", "order": 0, "children": ["chart-123"] }
+    ],
+    "activeTabId": "tab-1"
+  }
+}
+```
+
+### Comparison Matrix
+
+#### 1. Time Complexity
+
+| Operation | Approach 1 (Data in Tabs) | Approach 2 (Children Array) |
+|-----------|---------------------------|----------------------------|
+| Get active tab components | O(1) - Direct access | O(n) - Filter by children IDs |
+| Add chart to tab | O(1) - Direct insert | O(1) - Insert to root + push to children |
+| Delete chart from tab | O(1) - Direct delete | O(n) - Find in root + remove from children |
+| Move chart between tabs | O(n) - Copy + delete | O(1) - Move ID between children arrays |
+| Render tab | O(k) where k = charts in tab | O(n) - Filter n total charts |
+| Check chart exists in tab | O(k) where k = charts in tab | O(c) where c = children length |
+
+**Winner: Approach 1** — Faster for most read operations (rendering is most frequent)
+
+#### 2. Space Complexity
+
+| Factor | Approach 1 | Approach 2 |
+|--------|------------|------------|
+| Same chart in multiple tabs | Duplicated data | Single reference |
+| Storage per chart | Full object per tab | Full object once + ID refs |
+| API payload size | Larger if duplicates | Smaller, normalized |
+
+**Example: Same chart in 3 tabs**
+- Approach 1: 3 × (layout + component) ≈ 3KB
+- Approach 2: 1 × (layout + component) + 3 × ID ≈ 1.1KB
+
+**Winner: Approach 2** — Normalized, no duplication
+
+#### 3. Data Integrity & Consistency
+
+| Factor | Approach 1 | Approach 2 |
+|--------|------------|------------|
+| Single source of truth | No - data in multiple tabs | Yes - root level only |
+| Update chart config | Must update in ALL tabs | Update once at root |
+| Orphan data risk | Low | Possible (ID in children but deleted from root) |
+| Sync issues | Can have inconsistent copies | None (single copy) |
+
+**Winner: Approach 2** — Single source of truth
+
+#### 4. Backend & Database
+
+| Factor | Approach 1 | Approach 2 |
+|--------|------------|------------|
+| Migration complexity | High - transform all dashboards | Low - add tabs field only |
+| JSONField query | Complex nested queries | Simpler flat queries |
+| Validation | Each tab needs validation | Single validation at root |
+| Backward compatibility | Needs transformation layer | Native (tabs: null = show all) |
+
+**Winner: Approach 2** — Simpler backend changes
+
+#### 5. Frontend Rendering Performance
+
+| Factor | Approach 1 | Approach 2 |
+|--------|------------|------------|
+| Tab switch | Direct render (fast) | Filter then render |
+| React re-renders | Isolated per tab | May trigger parent re-renders |
+| Memoization | Easy per tab | Need careful filtering memo |
+
+**Approach 1 - Tab Switch Code:**
+```typescript
+const activeTab = tabs.find(t => t.id === activeTabId);
+return <Grid layout={activeTab.layout_config} />  // Direct access
+```
+
+**Approach 2 - Tab Switch Code:**
+```typescript
+const activeTab = tabs.find(t => t.id === activeTabId);
+const filteredLayout = layout_config.filter(l => activeTab.children.includes(l.i));
+return <Grid layout={filteredLayout} />  // Requires filtering
+```
+
+**Winner: Approach 1** — Faster rendering, no filtering overhead
+
+#### 6. Code Maintainability
+
+| Factor | Approach 1 | Approach 2 |
+|--------|------------|------------|
+| Mental model | "Tab owns its data" | "Root owns data, tabs group" |
+| Code paths | Single path per tab | Always filter |
+| Testing | Isolated tab tests | Need integration tests |
+| Debugging | Clear data location | Need to trace references |
+
+**Winner: Approach 1** — Simpler mental model
+
+#### 7. Scalability
+
+| Scenario | Approach 1 | Approach 2 |
+|----------|------------|------------|
+| 100 charts, 10 tabs | 100 items split across tabs | Filter 100 items per tab switch |
+| Large dashboards | Each tab loads only its data | Must load all, then filter |
+| Lazy loading potential | Yes - load tab on demand | Harder - data at root |
+
+**Winner: Approach 1** — Better for large dashboards
+
+#### 8. Migration & Rollback Safety
+
+| Factor | Approach 1 | Approach 2 |
+|--------|------------|------------|
+| Initial migration | Transform existing data | Add tabs field, keep existing |
+| Rollback safety | Hard - need reverse transform | Easy - remove tabs field |
+| Production risk | Higher | Lower |
+| Gradual rollout | Complex | Simple (feature flag) |
+
+**Winner: Approach 2** — Safer deployment
+
+#### 9. Critical Feature: Same Chart in Multiple Tabs
+
+| Requirement | Approach 1 | Approach 2 |
+|-------------|------------|------------|
+| Same chart, different positions | ✅ Supported | ❌ Not possible |
+| Same chart, different sizes | ✅ Supported | ❌ Not possible |
+| Independent tab layouts | ✅ Fully independent | ❌ Shared layout |
+
+**Critical Finding:** If the same chart appears in Tab 1 at position (0,0) and Tab 2 at position (6,0), Approach 2 **cannot handle this** because `layout_config` is shared at root level.
+
+### Final Summary
+
+| Category | Winner |
+|----------|--------|
+| Time Complexity (Read) | Approach 1 |
+| Space Complexity | Approach 2 |
+| Data Integrity | Approach 2 |
+| Backend Simplicity | Approach 2 |
+| Frontend Performance | Approach 1 |
+| Code Maintainability | Approach 1 |
+| Scalability | Approach 1 |
+| Migration Safety | Approach 2 |
+| **Same chart, different positions** | **Only Approach 1** |
+
+### Decision: Approach 1 (Data Inside Tabs)
+
+**Rationale:**
+1. **Flexibility**: Same chart can have different positions/sizes in different tabs
+2. **Performance**: O(1) access to active tab data, no filtering required
+3. **Scalability**: Large dashboards benefit from tab-isolated data
+4. **Simpler Code**: No filtering logic on every render
+5. **Future-proof**: Each tab is independent, easy to add tab-specific features
+
+**Migration Strategy (Frontend):**
+```typescript
+// When loading existing dashboard (tabs: null)
+if (!dashboard.tabs) {
+  dashboard.tabs = {
+    tabs: [{
+      id: generateTabId(),
+      title: "Untitled Tab 1",
+      order: 0,
+      layout_config: dashboard.layout_config,
+      components: dashboard.components
+    }],
+    activeTabId: "tab-1"
+  };
+  // Clear root level after migration
+  dashboard.layout_config = null;
+  dashboard.components = null;
+}
+```
+
+### API Response Handling
+
+After migration, dashboards with tabs will have empty/null `layout_config` and `components` at root level. To maintain a clean API response, the backend serializer should exclude these fields when `tabs` exists.
+
+**Problem:** Showing empty fields in API response is not clean for production.
+```json
+{
+  "id": 1,
+  "title": "My Dashboard",
+  "layout_config": null,
+  "components": null,
+  "tabs": { ... }
+}
+```
+
+**Solution:** Backend excludes empty root fields when tabs exist.
+
+**Django Serializer Implementation:**
+```python
+class DashboardSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Dashboard
+        fields = ['id', 'title', 'layout_config', 'components', 'tabs', ...]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # If tabs exist, exclude empty root-level layout fields from response
+        if data.get('tabs'):
+            data.pop('layout_config', None)
+            data.pop('components', None)
+        return data
+```
+
+**Clean API Response (with tabs):**
+```json
+{
+  "id": 1,
+  "title": "My Dashboard",
+  "tabs": {
+    "tabs": [
+      {
+        "id": "tab-1",
+        "title": "Untitled Tab 1",
+        "order": 0,
+        "layout_config": [...],
+        "components": {...}
+      }
+    ],
+    "activeTabId": "tab-1"
+  }
+}
+```
+
+**API Response (legacy dashboard without tabs):**
+```json
+{
+  "id": 2,
+  "title": "Old Dashboard",
+  "layout_config": [...],
+  "components": {...},
+  "tabs": null
+}
+```
+
+| Dashboard Type | `layout_config` in response | `components` in response | `tabs` in response |
+|----------------|-----------------------------|--------------------------|--------------------|
+| Legacy (no tabs) | ✅ Included | ✅ Included | `null` |
+| New (with tabs) | ❌ Excluded | ❌ Excluded | ✅ Included |
+
+This ensures clean API responses while maintaining backward compatibility for legacy dashboards.
+
+---
+
 ## Deliverables by Date
 
 | Date | Milestone | Deliverable |
