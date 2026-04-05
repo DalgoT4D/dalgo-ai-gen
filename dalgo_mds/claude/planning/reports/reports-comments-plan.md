@@ -1,0 +1,902 @@
+# Report Comments — Implementation Reference
+
+This document captures the full implementation of collaborative comments on report snapshots in Dalgo, including the Figma-based UI redesign.
+
+---
+
+## Architecture Overview
+
+```
+Frontend (webapp_v2)                          Backend (DDP_backend)
+┌─────────────────────┐                      ┌──────────────────────────────┐
+│ types/comments.ts   │                      │ models/comment.py            │
+│ hooks/api/          │  ──HTTP/JSON──▶      │ schemas/comment_schema.py    │
+│   useComments.ts    │                      │ api/comments_api.py          │
+│ components/reports/ │                      │ core/comments/               │
+│   comment-popover   │  ◀──JSON────         │   comment_service.py         │
+│   comment-icon      │                      │   mention_service.py         │
+│   utils.ts          │                      │   exceptions.py              │
+└─────────────────────┘                      └──────────────────────────────┘
+```
+
+**Key principle**: API → Core Service → Models (one-way dependency). The API layer is thin — it validates via Pydantic schemas, checks permissions, calls the service, and wraps responses.
+
+**Targeting model**: Comments are scoped to a **report snapshot** (`ReportSnapshot`). Each comment targets either the `report` (executive summary level) or a specific `chart` (by `snapshot_chart_id`). This is a flat comment model — no threading or nesting.
+
+---
+
+## Database Models (`ddpui/models/comment.py`)
+
+Three models:
+
+### `Comment`
+
+The core comment record.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `BigAutoField` | Primary key |
+| `target_type` | `CharField(max_length=20)` | `"dashboard"`, `"chart"`, or `"report"` (choices) |
+| `dashboard` | `ForeignKey(Dashboard)` | Nullable, for dashboard-level comments (legacy) |
+| `chart` | `ForeignKey(Chart)` | Nullable, for chart-level comments (legacy) |
+| `snapshot` | `ForeignKey(ReportSnapshot)` | Nullable, for report snapshot comments |
+| `snapshot_chart_id` | `IntegerField` | Nullable. Chart ID within `frozen_chart_configs` (NOT a FK) |
+| `content` | `TextField` | Comment text body (max 5000 chars enforced at schema level) |
+| `parent_comment` | `ForeignKey("self")` | Nullable, for threading (not used in reports) |
+| `author` | `ForeignKey(OrgUser)` | Comment author |
+| `org` | `ForeignKey(Org)` | Multi-tenant isolation |
+| `is_deleted` | `BooleanField` | Default `False` (soft delete) |
+| `created_at` | `DateTimeField` | Auto-set on creation |
+| `updated_at` | `DateTimeField` | Auto-set on every save |
+
+**Indexes**: `(dashboard, created_at)`, `(chart, created_at)`, `(parent_comment, created_at)`, `(org, created_at)`
+
+**For report comments**, only these fields are used: `target_type` (set to `"report"` or `"chart"`), `snapshot`, `snapshot_chart_id`, `content`, `author`, `org`, timestamps, and soft-delete fields.
+
+### `CommentMention`
+
+Tracks @mentions within a comment.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `BigAutoField` | Primary key |
+| `comment` | `ForeignKey(Comment)` | The comment containing the mention |
+| `mentioned_user` | `ForeignKey(OrgUser)` | The mentioned user |
+| `created_at` | `DateTimeField` | Auto-set |
+
+**Constraints**: `unique_together = [("comment", "mentioned_user")]`
+
+### `CommentReadStatus`
+
+Tracks per-user read state for each comment target on a report. `last_read_at` is updated when the user closes the comment popover. Comments with `created_at > last_read_at` are considered "new".
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `BigAutoField` | Primary key |
+| `user` | `ForeignKey(OrgUser)` | The user |
+| `snapshot` | `ForeignKey(ReportSnapshot)` | The report snapshot |
+| `target_type` | `CharField(max_length=20)` | `"report"` or `"chart"` |
+| `chart_id` | `IntegerField` | Nullable. Chart ID within frozen_chart_configs (for chart-level read status) |
+| `last_read_at` | `DateTimeField` | When the user last read this target's comments |
+
+**Constraints**: `unique_together = [("user", "snapshot", "target_type", "chart_id")]`
+
+**Indexes**: `(user, snapshot)`
+
+---
+
+## Backend Schemas (`ddpui/schemas/comment_schema.py`)
+
+### Request Schemas
+
+#### `CommentCreate` — body for `POST /api/comments/`
+
+| Field | Type | Required | Constraints | Description |
+|-------|------|----------|-------------|-------------|
+| `snapshot_id` | `int` | Yes | — | ReportSnapshot ID |
+| `target_type` | `str` | Yes | `"report"` or `"chart"` | What the comment is attached to |
+| `chart_id` | `int \| null` | No | Required when `target_type="chart"` | Chart ID within frozen_chart_configs |
+| `content` | `str` | Yes | min 1, max 5000 chars | Comment text body (may contain @email mentions) |
+
+```json
+{
+  "snapshot_id": 42,
+  "target_type": "chart",
+  "chart_id": 7,
+  "content": "This number looks off @noopur@projecttech4dev.org"
+}
+```
+
+#### `CommentUpdate` — body for `PUT /api/comments/{comment_id}/`
+
+| Field | Type | Required | Constraints | Description |
+|-------|------|----------|-------------|-------------|
+| `content` | `str` | Yes | min 1, max 5000 chars | Updated comment text |
+
+```json
+{
+  "content": "Updated: this number looks correct now"
+}
+```
+
+#### `MarkReadRequest` — body for `POST /api/comments/mark-read/`
+
+| Field | Type | Required | Constraints | Description |
+|-------|------|----------|-------------|-------------|
+| `snapshot_id` | `int` | Yes | — | ReportSnapshot ID |
+| `target_type` | `str` | Yes | `"report"` or `"chart"` | Which target to mark read |
+| `chart_id` | `int \| null` | No | Required when `target_type="chart"` | Chart ID within snapshot |
+
+```json
+{
+  "snapshot_id": 42,
+  "target_type": "report"
+}
+```
+
+### Response Schemas
+
+#### `CommentAuthorResponse` — nested inside CommentResponse
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `email` | `str` | User's email address |
+| `name` | `str \| null` | Display name (`first_name` + `last_name` from Django User), null if not set |
+
+```json
+{ "email": "noopur@projecttech4dev.org", "name": "Noopur Raval" }
+```
+
+**Helper**: `_get_user_name(orguser)` joins `user.first_name` and `user.last_name`, returns `None` if both empty.
+
+#### `CommentMentionResponse` — nested inside CommentResponse
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `email` | `str` | Mentioned user's email |
+| `name` | `str \| null` | Mentioned user's display name |
+
+```json
+{ "email": "siddhant@dalgo.in", "name": "Siddhant" }
+```
+
+#### `CommentResponse` — single comment, returned by list/create/update endpoints
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `int` | Comment primary key |
+| `target_type` | `str` | `"report"` or `"chart"` |
+| `snapshot_id` | `int` | ReportSnapshot ID |
+| `chart_id` | `int \| null` | Chart ID within frozen_chart_configs (null for report-level) |
+| `content` | `str` | Comment text body |
+| `author` | `CommentAuthorResponse` | Author email and name |
+| `is_deleted` | `bool` | Whether the comment is soft-deleted |
+| `is_new` | `bool` | Whether this comment is unread by the requesting user (computed from `CommentReadStatus.last_read_at`). Own comments are never marked as new. |
+| `created_at` | `datetime` | ISO-8601 creation timestamp |
+| `updated_at` | `datetime` | ISO-8601 last update timestamp |
+| `mentions` | `CommentMentionResponse[]` | List of @mentioned users |
+
+**`from_model(cls, comment)`** mapping:
+- `author.email` ← `comment.author.user.email`
+- `author.name` ← `_get_user_name(comment.author)`
+- `chart_id` ← `comment.snapshot_chart_id`
+- `is_new` ← `getattr(comment, "is_new", False)` (set by service layer)
+- `mentions` ← `comment.mentions.all()` (prefetched)
+
+```json
+{
+  "id": 15,
+  "target_type": "chart",
+  "snapshot_id": 42,
+  "chart_id": 7,
+  "content": "This number looks off @siddhant@dalgo.in",
+  "author": {
+    "email": "noopur@projecttech4dev.org",
+    "name": "Noopur Raval"
+  },
+  "is_edited": false,
+  "is_deleted": false,
+  "is_new": true,
+  "created_at": "2026-03-13T10:30:00Z",
+  "updated_at": "2026-03-13T10:30:00Z",
+  "mentions": [
+    { "email": "siddhant@dalgo.in", "name": "Siddhant" }
+  ]
+}
+```
+
+#### `CommentStateEntry` — nested inside CommentStatesResponse
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | `str` | One of: `"none"`, `"unread"`, `"read"`, `"mentioned"` |
+| `count` | `int` | Number of unread comments for this target |
+
+#### `CommentStatesResponse` — returned by `GET /api/comments/states/`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `states` | `Dict[str, CommentStateEntry]` | Map of target key → state+count. Key is `"report"` for report-level, or the chart_id as a string (e.g., `"7"`) for chart-level |
+
+```json
+{
+  "states": {
+    "report": { "state": "read", "count": 0 },
+    "7": { "state": "mentioned", "count": 3 },
+    "12": { "state": "unread", "count": 1 }
+  }
+}
+```
+
+#### `MentionableUserResponse` — returned by `GET /api/comments/mentionable-users/`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `email` | `str` | User's email |
+| `name` | `str \| null` | User's display name |
+
+**`from_orguser(cls, orguser)`** mapping: `email` ← `orguser.user.email`, `name` ← `_get_user_name(orguser)`
+
+```json
+{ "email": "noopur@projecttech4dev.org", "name": "Noopur Raval" }
+```
+
+### API Response Wrapper
+
+All endpoints wrap data in `ApiResponse`:
+
+```json
+{
+  "success": true,
+  "message": "Comment created",
+  "data": { ... }
+}
+```
+
+Error responses (Django Ninja HttpError):
+```json
+{
+  "detail": "Chart 99 not found in snapshot 42"
+}
+```
+
+---
+
+## Full API Contract (`ddpui/api/comments_api.py`)
+
+**Router**: `comments_router = Router()` mounted at `/api/comments/` in `routes.py`.
+
+All endpoints require `@has_permission(["can_view_dashboards"])`.
+
+**CRITICAL: Route ordering** — Named routes (`/states/`, `/mentionable-users/`, `/mark-read/`) MUST be registered BEFORE `/{comment_id}/` to avoid 405 errors.
+
+### `GET /api/comments/states/?snapshot_id={N}`
+
+Returns icon states for all targets in a snapshot (for badge rendering).
+
+**Query params**: `snapshot_id` (int, required)
+
+**Response**: `ApiResponse<CommentStatesResponse>`
+```json
+{
+  "success": true,
+  "data": {
+    "states": {
+      "report": { "state": "read", "count": 0 },
+      "7": { "state": "mentioned", "count": 3 }
+    }
+  }
+}
+```
+
+**Errors**: 400 if snapshot not found
+
+---
+
+### `GET /api/comments/mentionable-users/`
+
+Returns all org users available for @mention autocomplete.
+
+**Query params**: none
+
+**Response**: `ApiResponse<MentionableUserResponse[]>`
+```json
+{
+  "success": true,
+  "data": [
+    { "email": "noopur@projecttech4dev.org", "name": "Noopur Raval" },
+    { "email": "siddhant@dalgo.in", "name": "Siddhant" },
+    { "email": "admin@org.com", "name": null }
+  ]
+}
+```
+
+---
+
+### `POST /api/comments/mark-read/`
+
+Marks a target's comments as read for the current user (upserts `CommentReadStatus`).
+
+**Body**: `MarkReadRequest`
+```json
+{ "snapshot_id": 42, "target_type": "chart", "chart_id": 7 }
+```
+
+**Response**: `ApiResponse` (no data)
+```json
+{ "success": true, "message": "Marked as read" }
+```
+
+**Errors**: 400 if snapshot not found
+
+---
+
+### `GET /api/comments/?snapshot_id={N}&target_type={T}&chart_id={N}`
+
+Lists all non-deleted comments for a target, ordered chronologically by `created_at`.
+
+**Query params**:
+- `snapshot_id` (int, required)
+- `target_type` (str, required): `"report"` or `"chart"`
+- `chart_id` (int, optional): required when `target_type="chart"`
+
+**Response**: `ApiResponse<CommentResponse[]>`
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 14,
+      "target_type": "chart",
+      "snapshot_id": 42,
+      "chart_id": 7,
+      "content": "Great progress here",
+      "author": { "email": "admin@org.com", "name": null },
+      "is_edited": false,
+      "is_deleted": false,
+      "is_new": false,
+      "created_at": "2026-03-11T08:00:00Z",
+      "updated_at": "2026-03-11T08:00:00Z",
+      "mentions": []
+    },
+    {
+      "id": 15,
+      "target_type": "chart",
+      "snapshot_id": 42,
+      "chart_id": 7,
+      "content": "This number looks off @siddhant@dalgo.in",
+      "author": { "email": "noopur@projecttech4dev.org", "name": "Noopur Raval" },
+      "is_edited": false,
+      "is_deleted": false,
+      "is_new": true,
+      "created_at": "2026-03-13T10:30:00Z",
+      "updated_at": "2026-03-13T10:30:00Z",
+      "mentions": [{ "email": "siddhant@dalgo.in", "name": "Siddhant" }]
+    }
+  ]
+}
+```
+
+**Errors**: 400 if `chart_id` missing for chart target, or snapshot not found
+
+---
+
+### `POST /api/comments/`
+
+Creates a new comment.
+
+**Body**: `CommentCreate`
+```json
+{
+  "snapshot_id": 42,
+  "target_type": "chart",
+  "chart_id": 7,
+  "content": "This number looks off @siddhant@dalgo.in"
+}
+```
+
+**Response**: `ApiResponse<CommentResponse>`
+```json
+{
+  "success": true,
+  "message": "Comment created",
+  "data": {
+    "id": 15,
+    "target_type": "chart",
+    "snapshot_id": 42,
+    "chart_id": 7,
+    "content": "This number looks off @siddhant@dalgo.in",
+    "author": { "email": "noopur@projecttech4dev.org", "name": "Noopur Raval" },
+    "is_edited": false,
+    "is_deleted": false,
+    "is_new": false,
+    "created_at": "2026-03-13T10:30:00Z",
+    "updated_at": "2026-03-13T10:30:00Z",
+    "mentions": [{ "email": "siddhant@dalgo.in", "name": "Siddhant" }]
+  }
+}
+```
+
+**Side effects**:
+- `MentionService.process_mentions()` parses @email mentions from content
+- Creates `CommentMention` records for each detected org user
+- Creates `Notification` + `NotificationRecipient` records
+
+**Errors**: 400 (invalid target_type, missing chart_id, chart not in snapshot's `frozen_chart_configs`), 500 (unexpected)
+
+---
+
+### `PUT /api/comments/{comment_id}/`
+
+Updates a comment's content. Author-only.
+
+**Path params**: `comment_id` (int)
+
+**Body**: `CommentUpdate`
+```json
+{ "content": "Updated: this number is correct now" }
+```
+
+**Response**: `ApiResponse<CommentResponse>`
+```json
+{
+  "success": true,
+  "message": "Comment updated",
+  "data": {
+    "id": 15,
+    "content": "Updated: this number is correct now",
+    "is_edited": true,
+    "..."
+  }
+}
+```
+
+**Side effects**: Deletes all old `CommentMention` records for this comment, then re-runs `MentionService.process_mentions()` on the new content.
+
+**Errors**: 404 (not found or deleted), 403 (not the author)
+
+---
+
+### `DELETE /api/comments/{comment_id}/`
+
+Soft-deletes a comment. Author-only. Sets `is_deleted=True` and `deleted_at=now()`.
+
+**Path params**: `comment_id` (int)
+
+**Body**: none
+
+**Response**: `ApiResponse` (no data)
+```json
+{ "success": true, "message": "Comment deleted" }
+```
+
+**Errors**: 404 (not found or already deleted), 403 (not the author)
+
+---
+
+## Core Service (`ddpui/core/comments/comment_service.py`)
+
+Static methods on `CommentService` class:
+
+| Method | Purpose |
+|--------|---------|
+| `list_comments(snapshot_id, org, target_type, chart_id, orguser)` | Flat chronological list with `is_new` annotation based on `CommentReadStatus.last_read_at` |
+| `create_comment(snapshot_id, org, orguser, target_type, content, chart_id)` | Validates target, creates comment, delegates to `MentionService.process_mentions()` |
+| `update_comment(comment_id, org, orguser, content)` | Author-only, re-processes mentions. Rejects if comment is deleted. |
+| `delete_comment(comment_id, org, orguser)` | Author-only soft delete: sets `is_deleted=True`, clears `content` and `mentioned_emails` |
+| `get_comment_states(snapshot_id, org, orguser)` | Returns icon state + unread count per target |
+| `mark_as_read(snapshot_id, org, orguser, target_type, chart_id)` | Upserts `CommentReadStatus` with `last_read_at = now()` |
+| `get_mentionable_users(org)` | Returns all OrgUsers in the org, ordered by email |
+
+### Icon state computation (`get_comment_states`)
+
+1. Fetches all non-deleted comments for the snapshot (values: `target_type`, `snapshot_chart_id`, `created_at`, `id`)
+2. Fetches all `CommentReadStatus` entries for the user on this snapshot
+3. Fetches all non-deleted `CommentMention` IDs where `mentioned_user=orguser` on this snapshot
+4. Groups comments by target key (`"report"` or `str(chart_id)`)
+5. For each target:
+   - Counts unread comments (`created_at > last_read_at`, or all if no read status)
+   - Checks if any unread comment ID is in the mentioned set
+6. Returns state priority: `mentioned > unread > read`
+
+### Mention parsing (`MentionService`)
+
+- Regex: `r'@([\w.+-]+@[\w.-]+\.\w+)'`
+- Resolves each email to an `OrgUser` in the same org
+- Creates `CommentMention` records (ignores unknown emails silently)
+- Creates `Notification` + `NotificationRecipient` records for each mentioned user
+
+### Exceptions (`ddpui/core/comments/exceptions.py`)
+
+```
+CommentError (base)
+├── CommentNotFoundError     → 404
+├── CommentValidationError   → 400
+└── CommentPermissionError   → 403
+```
+
+Each has `message` and `error_code` attributes.
+
+---
+
+## Frontend Types (`types/comments.ts`)
+
+```typescript
+// Author/mention info
+export interface CommentAuthor {
+  email: string;
+  name?: string;
+}
+
+export interface CommentMention {
+  email: string;
+  name?: string;
+}
+
+// Core comment object (matches CommentResponse from backend)
+export interface Comment {
+  id: number;
+  target_type: 'report' | 'chart';
+  snapshot_id: number;
+  chart_id?: number;
+  content: string;
+  author: CommentAuthor;
+  is_edited: boolean;
+  is_deleted: boolean;
+  is_new: boolean;
+  created_at: string;
+  updated_at: string;
+  mentions: CommentMention[];
+}
+
+// Icon state for badge rendering
+export type CommentIconState = 'none' | 'unread' | 'read' | 'mentioned';
+
+// Per-target state entry
+export interface CommentStateEntry {
+  state: CommentIconState;
+  count: number;
+}
+
+// Map of all target states for a snapshot
+export interface CommentStates {
+  [key: string]: CommentStateEntry; // "report" or chart_id string → { state, count }
+}
+
+// Mentionable user for @mention dropdown
+export interface MentionableUser {
+  email: string;
+  name?: string;
+}
+
+// Mutation payloads
+export interface CreateCommentPayload {
+  snapshot_id: number;
+  target_type: 'report' | 'chart';
+  chart_id?: number;
+  content: string;
+}
+
+export interface MarkReadPayload {
+  snapshot_id: number;
+  target_type: 'report' | 'chart';
+  chart_id?: number;
+}
+```
+
+---
+
+## Frontend API Hooks (`hooks/api/useComments.ts`)
+
+### SWR Read Hooks
+
+```typescript
+// List comments for a target (conditional — only fetches when popover is open)
+useComments(snapshotId: number | null, targetType, chartId?)
+// SWR key: /api/comments/?snapshot_id=N&target_type=T&chart_id=N (null key when closed)
+// Returns: { comments: Comment[], isLoading, isError, mutate }
+
+// Get icon states for all targets in a snapshot
+useCommentStates(snapshotId: number | null)
+// SWR key: /api/comments/states/?snapshot_id=N
+// Returns: { states: CommentStates, isLoading, isError, mutate }
+
+// Get all org users for @mention autocomplete
+useMentionableUsers()
+// SWR key: /api/comments/mentionable-users/
+// Returns: { users: MentionableUser[], isLoading, isError }
+```
+
+All hooks use `revalidateOnFocus: false`.
+
+### Mutation Functions
+
+```typescript
+// POST /api/comments/
+createComment(payload: CreateCommentPayload): Promise<Comment>
+
+// PUT /api/comments/{commentId}/
+updateComment(commentId: number, content: string): Promise<Comment>
+
+// DELETE /api/comments/{commentId}/
+deleteComment(commentId: number): Promise<void>
+
+// POST /api/comments/mark-read/
+markAsRead(payload: MarkReadPayload): Promise<void>
+```
+
+### Frontend API Response Wrapper
+
+The hooks expect all backend responses wrapped in:
+```typescript
+interface ApiResponse<T> {
+  success: boolean;
+  data: T;
+  message?: string;
+}
+```
+
+SWR hooks extract `data?.data` (the inner payload) when returning values.
+
+---
+
+## Frontend Utilities (`components/reports/utils.ts`)
+
+| Function | Purpose |
+|----------|---------|
+| `formatCommentTime(dateStr)` | Short relative timestamps: "just now", "10 mins. ago", "3 hrs. ago", "2 days ago", "1 week ago" |
+| `getAvatarColor(email)` | Generates consistent color from email hash (31-multiply hash). 10-color palette: `#4285F4` blue, `#34A853` green, `#EA4335` red, `#FBBC04` yellow, `#E91E63` pink, `#9C27B0` purple, `#FF5722` deep orange, `#00BCD4` cyan, `#795548` brown, `#607D8B` blue grey |
+| `getInitials(author)` | First letters of name words (max 2), or first letter of email |
+| `parseCommentMentions(content)` | Regex `/@([\w.+-]+@[\w.-]+\.\w+)/g` splits text into `{type: 'text' \| 'mention', value}` array for rendering |
+| `formatCreatedOn(dateStr)` | Report list table timestamps (different format, not used by comments) |
+| `formatDateShort(dateStr)` | MM/DD/YYYY format for report headers |
+
+---
+
+## Frontend Components
+
+### CommentIcon (`components/reports/comment-icon.tsx`)
+
+Renders the trigger icon based on `CommentIconState`. All indicators use `#D92A2A` red.
+
+| State | Icon | Indicator |
+|-------|------|-----------|
+| `none` | `MessageSquareText` | None |
+| `read` | `MessageSquareText` | 8x8px outlined dot (top-right, 1.5px `#D92A2A` border, white fill) |
+| `unread` | `MessageSquareText` | 8x8px filled `#D92A2A` dot (top-right) |
+| `mentioned` | `MessageSquareText` | 12x12px `#D92A2A` circle with white `@` text (top-right). Font: 8px, weight 400, letter-spacing 2% |
+
+Icons: `h-5 w-5`.
+
+### CommentPopover (`components/reports/comment-popover.tsx`)
+
+Radix `Popover` with Figma-based redesign.
+
+**Props**:
+```typescript
+interface CommentPopoverProps {
+  snapshotId: number;
+  targetType: 'report' | 'chart';
+  chartId?: number;
+  state: CommentIconState;
+  count?: number;
+  triggerClassName?: string;
+  onStateChange?: () => void;
+}
+```
+
+**Design**:
+- **No header** — comments flow directly at the top of the popover
+- **Colored avatars** — each user gets a unique background color (from `getAvatarColor`) with white initials
+- **Email displayed** — comment author shown as email address
+- **Short timestamps** — "just now", "5 mins. ago", "2 days ago" via `formatCommentTime`
+- **@mentions as styled text** — `CommentContent` component renders mentions in `text-primary font-medium`
+- **Ellipsis menu** — author's own comments show `...` (`MoreHorizontal`) on hover (`group-hover:opacity-100`), opening a `DropdownMenu` with Edit and Delete
+- **Single-line input** — plain `<input type="text">` with "Add a comment" placeholder
+- **Circular send button** — `ArrowUp` icon in round button; `bg-muted` when empty, `bg-primary text-white` when text entered
+- **Enter to send** — single Enter key submits
+- **@mention dropdown** — positioned above input (`absolute bottom-full`), shows colored avatars per user
+- **Popover width** — `w-[383px]` (383px), max height `min(450px, 80vh)`, rounded-lg (8px radius), `#00897B` border, drop shadow `-4px 4px 11px rgba(0,0,0,0.22)`, white background
+
+**Sub-components** (all `memo`'d):
+- `MentionDropdown` — filters users by typed query, positioned absolutely above input
+- `CommentContent` — parses @mentions into blue styled spans via `parseCommentMentions`
+- `CommentItem` — renders single comment with avatar, email, timestamp, content, hover ellipsis menu
+
+**Behavior**:
+- Comments fetched via `useComments` only when popover is open (conditional SWR key: `open ? snapshotId : null`)
+- Auto-scrolls to latest (bottom) comment on open (100ms delay)
+- Auto-scrolls to bottom after posting a new comment
+- `markAsRead` called on close, then `onStateChange()` to refresh parent's icon states
+- Edit mode: "Editing comment" indicator with cancel (X) button, input pre-filled with existing content
+- New comment indicator: small 8x8px teal dot (`#00897B` at 40% opacity) on the right side of each new comment (replaces previous yellow background). Own comments are never marked as new.
+- Edited label: shows "· edited" after the timestamp when `updated_at !== created_at` (not shown for deleted comments)
+- Soft-deleted comments: show "This message was deleted" placeholder with clock icon, persists across sessions via `is_deleted` from API
+- Delete uses `mutateComments()` to refetch from API (no local `deletedIds` state)
+
+---
+
+## Integration Points
+
+### Report header (`app/reports/[snapshotId]/page.tsx`)
+
+```tsx
+<CommentPopover
+  snapshotId={snapshotId}
+  targetType="report"
+  state={commentStates?.['report']?.state ?? 'none'}
+  count={commentStates?.['report']?.count ?? 0}
+  triggerClassName="h-9 w-9"
+  onStateChange={handleCommentStateChange}
+/>
+```
+
+### Chart cards (`components/dashboard/chart-element-view.tsx`)
+
+```tsx
+{frozenChartConfig && snapshotId && (
+  <CommentPopover
+    snapshotId={snapshotId}
+    targetType="chart"
+    chartId={chartId}
+    state={(commentStates?.[String(chartId)]?.state as CommentIconState) ?? 'none'}
+    count={commentStates?.[String(chartId)]?.count ?? 0}
+    triggerClassName="h-7 w-7 p-0"
+    onStateChange={onCommentStateChange}
+  />
+)}
+```
+
+### State management flow
+
+1. `useCommentStates(snapshotId)` fetches all icon states at report page level
+2. States passed down via props: `page` → `DashboardNativeView` → `ChartElementView`
+3. After any comment action (create/edit/delete/close popover), `onStateChange()` calls `mutateCommentStates()` to refresh all badges
+
+---
+
+## Figma Design Decisions
+
+1. **Colored avatars** — not gray; each user gets a stable unique color from a 10-color palette based on email hash
+2. **Hover-reveal "..." menu** — Edit/Delete hidden by default, appear on hover via `group`/`group-hover:opacity-100`, uses Radix DropdownMenu
+3. **Single-line input** — simpler than a textarea, Enter to send (not Cmd+Enter)
+4. **Circular send button** — round, gray when empty, teal/primary when text entered, uses ArrowUp icon
+5. **No popover header** — no "Comments" title bar, comments flow directly
+6. **#D92A2A red indicators** — all icon indicators (dots, `@` badge) use `#D92A2A` red. Read dot: 8x8px white fill with 1.5px `#D92A2A` border. Unread dot: 8x8px filled. `@` badge: 12x12px circle, 8px font, weight 400
+7. **@mentions rendered inline** — @email in comment text shown as `text-primary font-medium`
+8. **Email as author label** — shows email address, not name (consistent with Figma)
+9. **Short relative timestamps** — "just now", "10 mins. ago", "3 hrs. ago", "2 days ago"
+
+---
+
+## Gotchas & Lessons Learned
+
+### 1. Django Ninja Route Ordering
+Static path endpoints (`/states/`, `/mentionable-users/`, `/mark-read/`) MUST be registered before dynamic `/{comment_id}/`. Otherwise Django Ninja tries to parse "states" as an integer → 405 error.
+
+### 2. Auth Store for Current User
+`useAuthStore((s) => s.getCurrentOrgUser()?.email ?? '')` is the correct way to get the current user's email. Do NOT use `localStorage.getItem('dalgo-auth')` — the auth store uses `persist: false` with cookie-based auth, so that key doesn't exist in localStorage.
+
+### 3. Conditional SWR Fetching
+Pass `null` as the snapshot ID to `useComments` when the popover is closed: `useComments(open ? snapshotId : null, ...)`. This prevents unnecessary API calls.
+
+### 4. Popover Interaction with Dropdowns
+The `onInteractOutside` handler on `PopoverContent` prevents closing when clicking inside the mention dropdown by checking `target.closest('[data-testid="mention-dropdown"]')`.
+
+### 5. Soft Delete Display
+Deleted comments show "This message was deleted" in italic muted text with a clock icon. Soft-deleted comments ARE returned in list queries (they remain in the DB with `is_deleted=True`, `content=""`, `mentioned_emails=[]`). They are excluded from `get_comment_states()` counts. Editing a deleted comment is rejected with a validation error.
+
+### 6. Multi-Tenant Isolation
+Every backend query includes `org=org`. The org comes from `request.orguser.org` in the API layer.
+
+### 7. Chart ID Validation
+When creating a chart comment, the service validates that `str(chart_id)` exists as a key in the snapshot's `frozen_chart_configs` dict.
+
+### 8. Read Status Per Target
+`CommentReadStatus` tracks `last_read_at` per `(user, snapshot, target_type, chart_id)`. Read state is independent between report-level comments and each chart's comments.
+
+---
+
+## File Inventory
+
+### Backend — Created
+| File | Purpose |
+|------|---------|
+| `ddpui/models/comment.py` | Comment, CommentMention, CommentReadStatus models |
+| `ddpui/core/comments/__init__.py` | Public exports |
+| `ddpui/core/comments/comment_service.py` | CRUD, icon states, mark-as-read, mentionable users |
+| `ddpui/core/comments/mention_service.py` | @mention parsing, notification dispatch |
+| `ddpui/core/comments/exceptions.py` | CommentError hierarchy |
+| `ddpui/schemas/comment_schema.py` | Request/response Pydantic schemas |
+| `ddpui/api/comments_api.py` | HTTP endpoints with permission checks |
+
+### Backend — Modified
+| File | Change |
+|------|--------|
+| `ddpui/routes.py` | Added `comments_router` mount at `/api/comments/` |
+
+### Frontend — Created
+| File | Purpose |
+|------|---------|
+| `types/comments.ts` | TypeScript interfaces for Comment, states, mentions, payloads |
+| `hooks/api/useComments.ts` | SWR hooks + mutation functions |
+| `components/reports/comment-popover.tsx` | Comment popover with @mentions, colored avatars, ellipsis menu |
+| `components/reports/comment-icon.tsx` | Icon with state-based rendering and rose-500 badge |
+
+### Frontend — Modified
+| File | Change |
+|------|--------|
+| `components/reports/utils.ts` | Added `formatCommentTime`, `getAvatarColor`, `getInitials`, `parseCommentMentions` |
+| `components/dashboard/chart-element-view.tsx` | Added `<CommentPopover>` to chart toolbar (report mode only) |
+| `app/reports/[snapshotId]/page.tsx` | Added report-level `<CommentPopover>` in header, `useCommentStates` hook |
+| `components/dashboard/dashboard-native-view.tsx` | Passes `snapshotId`, `commentStates`, `onCommentStateChange` to chart views |
+
+---
+
+## Potential Improvements
+
+These are identified but not yet implemented:
+
+1. **Loading skeleton on first open** — show a spinner/skeleton while SWR fetches comments, instead of briefly showing "No comments yet"
+2. **Prefer name over email** — show `author.name || author.email` instead of always email (current implementation shows email to match Figma, but this may change)
+3. **Keyboard navigation for @mentions** — arrow keys to navigate mention dropdown, Enter to select
+4. **Optimistic UI updates** — immediately append new comment to list before SWR revalidation completes
+5. **Character limit indicator** — show remaining characters near limit, or enforce max-length on input
+6. **Send button tooltip** — tooltip "Send (Enter)" on the circular send button for discoverability
+
+---
+
+## Changelog
+
+### Session 2026-03-22
+
+#### Backend Changes
+
+1. **Soft delete for comments** (`ddpui/models/comment.py`, `ddpui/core/comments/comment_service.py`)
+   - Added `is_deleted = models.BooleanField(default=False)` to Comment model
+   - Migration: `0155_comment_is_deleted`
+   - `delete_comment()`: soft-deletes by setting `is_deleted=True`, clearing `content` and `mentioned_emails`
+   - `update_comment()`: rejects editing deleted comments with `CommentValidationError`
+   - `get_comment_states()`: excludes deleted comments from counts and mention checks
+   - `list_comments()`: own comments (`author_id == orguser.id`) are never marked `is_new`
+
+2. **`is_deleted` in API response** (`ddpui/schemas/comment_schema.py`)
+   - Added `is_deleted: bool = False` to `CommentResponse` and `from_model()`
+
+3. **Dashboard ID in frozen snapshots** (`ddpui/core/reports/report_service.py`)
+   - `_freeze_dashboard()` now stores `dashboard_id` in frozen config
+   - `get_snapshot_view_data()` passes `dashboard_id` through `report_metadata`
+   - Backfilled `dashboard_id` into all 7 existing snapshots
+
+#### Frontend Changes
+
+4. **Comment type updated** (`webapp_v2/types/comments.ts`)
+   - Added `is_deleted: boolean` to `Comment` interface
+
+5. **Soft delete UI** (`webapp_v2/components/reports/comment-popover.tsx`)
+   - Removed `deletedIds` local state — uses `comment.is_deleted` from API
+   - `handleDelete` calls `mutateComments()` to refetch after delete
+   - Added "· edited" label when `updated_at !== created_at`
+   - New comment indicator: teal dot (`#00897B` at 40%, 8x8px) instead of yellow background
+   - Auto-scrolls to bottom on open and after posting
+
+6. **Comment icon redesign** (`webapp_v2/components/reports/comment-icon.tsx`)
+   - Icon: `MessageSquareText` at `h-5 w-5`
+   - All indicators use `#D92A2A` red
+   - Read: 8x8px white dot with 1.5px `#D92A2A` border
+   - Unread: 8x8px filled `#D92A2A` dot
+   - Mentioned: 12x12px `#D92A2A` circle with `@` (8px, weight 400)
+
+7. **Comment popover styling** (`webapp_v2/components/reports/comment-popover.tsx`)
+   - Width: 383px, border-radius: 8px, border: `#00897B`, white background
+   - Drop shadow: `-4px 4px 11px rgba(0,0,0,0.22)`
+   - Long text uses `break-all` to prevent overflow
+
+8. **Dashboard link in report header** (`webapp_v2/app/reports/[snapshotId]/page.tsx`)
+   - Dashboard title is now a clickable `<Link>` to `/dashboards/{dashboard_id}`
+   - Falls back to plain text for old snapshots without `dashboard_id`
+   - Added `dashboard_id?: number` to `ReportMetadata` type
+
+9. **Executive summary read-only by default** (`webapp_v2/app/reports/[snapshotId]/page.tsx`)
+   - Textarea is `readOnly` until the pencil edit button is clicked
+   - Reverts to read-only after saving
