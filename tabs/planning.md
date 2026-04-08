@@ -11,11 +11,11 @@
 | Milestone | Status | Notes |
 |-----------|--------|-------|
 | M1 — Tab Bar UI | 🟢 Complete | All components created, TabBar integrated |
-| M2 — Backend API | 🟢 Complete | Schema, service, Schema migration, API updated |
-| M3 — Add Charts | 🔴 Not Started | Depends on M2 |
-| M4 — Migration & Testing | 🔴 Not Started | Depends on M3 |
+| M2 — Backend API | 🟢 Complete | Schema, service, schema migration, API updated |
+| M3 — Add Charts | 🟢 Complete | State sync, save/load, tab handlers, reusable utils |
+| M4 — Migration & Testing | 🟡 In Progress | Preview Mode done, Data Migration remaining |
 
-**Current Focus:** Milestone 3 — Add Charts Inside Tabs
+**Current Focus:** Milestone 4 — Data Migration Script
 
 **Last Updated:** March 26, 2026
 
@@ -472,13 +472,16 @@ When a user clicks "Add Chart", the system checks which tab is currently active 
 
 ### M3 Progress Checklist
 
-#### Frontend Files to Modify
-- [ ] `webapp_v2/components/dashboard/dashboard-builder-v2.tsx` — Update add/remove/save flows
-- [ ] `webapp_v2/hooks/api/useDashboards.ts` — Ensure tabs in payload
+#### Frontend Files Modified
+- [x] `webapp_v2/components/dashboard/dashboard-builder-v2.tsx` — Tab handlers, state sync, save/load
+- [x] `webapp_v2/components/dashboard/dashboard-native-view.tsx` — View mode uses active tab data
+- [x] `webapp_v2/components/dashboard/tabs/tab-utils.ts` — Added `initializeTabsData`, `getActiveTabData`
+- [x] `webapp_v2/components/dashboard/tabs/TabBar.tsx` — Single tab rename styling fix
 
 #### Testing
-- [ ] Integration tests
-- [ ] Manual testing
+- [x] Manual testing (add charts, switch tabs, save/reload, delete tabs)
+
+**✅ M3 Complete**
 
 ---
 
@@ -562,18 +565,18 @@ def migrate_dashboards_to_tabs(apps, schema_editor):
 
 ### M4 Progress Checklist
 
-#### Migration
+#### Preview Mode ✅
+- [x] Update `dashboard-native-view.tsx` for tabs
+- [x] Use active tab's layout and components via `getActiveTabData`
+- [x] Single tab → hide tab bar (`shouldShowTabs = tabs.length >= 2`)
+- [x] Multiple tabs → show tab bar (no edit controls, `isEditMode={false}`)
+
+#### Data Migration (Remaining)
 - [ ] `DDP_backend/ddpui/migrations/XXXX_migrate_dashboards_to_tabs.py` — Data migration
 - [ ] Test migration on staging
 - [ ] Deploy migration to production
 
-#### Preview Mode
-- [ ] Update `dashboard-native-view.tsx` for tabs
-- [ ] Update public dashboard view for tabs
-- [ ] Single tab → hide tab bar
-- [ ] Multiple tabs → show tab bar (no edit controls)
-
-#### Testing
+#### Testing (Remaining)
 - [ ] E2E tests
 - [ ] Manual testing all flows
 - [ ] Bug fixes
