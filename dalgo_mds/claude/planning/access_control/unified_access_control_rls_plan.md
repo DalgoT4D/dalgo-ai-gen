@@ -284,13 +284,18 @@ Apply to all page-level layouts:
 
 **Scope**: New model + API + frontend. Lets users share specific dashboards/charts with specific org users.
 
+> **V2 spec alignment**: This phase implements the core of the V2 Access Control spec — paste-to-share, matched/unmatched email handling, chart inheritance from dashboards, Analyst invite-as-Viewer, and view/edit permission levels (no "manage" level in V1).
+
 #### 3a. ResourceShare model (`ddpui/models/resource_sharing.py`)
 
 ```python
 class SharePermission(models.TextChoices):
     VIEW = "view"
     EDIT = "edit"
-    MANAGE = "manage"  # can reshare, delete
+
+class ShareStatus(models.TextChoices):
+    ACTIVE = "active"
+    PENDING = "pending"  # user invited but hasn't accepted yet
 
 class ResourceShare(models.Model):
     uuid = models.UUIDField(default=uuid4, unique=True)
@@ -298,8 +303,12 @@ class ResourceShare(models.Model):
     object_id = models.PositiveIntegerField()
     resource = GenericForeignKey("content_type", "object_id")
     shared_by = models.ForeignKey(OrgUser, on_delete=models.CASCADE, related_name="shares_given")
-    shared_with = models.ForeignKey(OrgUser, on_delete=models.CASCADE, related_name="shares_received")
+    shared_with = models.ForeignKey(OrgUser, null=True, blank=True, on_delete=models.CASCADE, related_name="shares_received")
+    shared_with_email = models.EmailField(null=True, blank=True)  # for pending invites (unmatched emails)
     permission = models.CharField(max_length=10, choices=SharePermission.choices, default=SharePermission.VIEW)
+    status = models.CharField(max_length=10, choices=ShareStatus.choices, default=ShareStatus.ACTIVE)
+    is_inherited = models.BooleanField(default=False)  # True if inherited from parent dashboard
+    parent_share = models.ForeignKey("self", null=True, blank=True, on_delete=models.CASCADE, related_name="inherited_shares")
     org = models.ForeignKey(Org, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -309,42 +318,95 @@ class ResourceShare(models.Model):
         indexes = [
             models.Index(fields=["content_type", "object_id"]),
             models.Index(fields=["shared_with"]),
+            models.Index(fields=["shared_with_email"]),
         ]
 ```
 
 Uses Django ContentType GenericFK — one table for all resource types (Dashboard, Chart, ReportSnapshot).
 
-#### 3b. Access check service (`ddpui/core/access_service.py`)
+**Key additions vs original plan**:
+- `shared_with_email` — stores email for pending invites (unmatched emails from paste-to-share)
+- `shared_with_group` — FK to `UserGroup` for group-based sharing (see `groups_and_sharing_plan.md`)
+- `status` — tracks pending (invited but not accepted) vs active shares
+- `is_inherited` + `parent_share` — tracks chart shares inherited from dashboard sharing
+- No "manage" permission level — only owners can manage sharing (per V2 spec)
+
+> **User Groups**: `UserGroup` and `UserGroupMember` models are defined in the detailed groups plan at `groups_and_sharing_plan.md`. ResourceShare supports sharing with individual users, groups, or pending emails — exactly one target per share record.
+
+#### 3b. Chart inheritance from dashboards
+
+> **V2 spec**: "If a dashboard is shared, charts inside it inherit the access (view/edit). Charts inherited via dashboards will appear in 'My Charts' and behave like directly shared view-only charts."
+
+When a dashboard is shared:
+1. Query all charts belonging to that dashboard
+2. For each chart, create a `ResourceShare` with `is_inherited=True`, `parent_share=dashboard_share`
+3. Inherited shares have same permission level as the dashboard share
+4. If dashboard share is revoked, cascade-delete all inherited chart shares via `parent_share` FK
+5. If dashboard share permission changes (view→edit), update inherited chart shares too
+6. If a chart is removed from the dashboard, delete its inherited shares
+7. Directly shared charts take precedence over inherited shares (higher permission wins)
+
+**Edit access inheritance**: If a user is granted edit access to a dashboard, they also receive edit access to all charts within it.
+
+#### 3c. Access check service (`ddpui/core/access_service.py`)
 
 Central service:
-- `can_access(orguser, resource, required="view")` — checks: creator? → admin role? → ResourceShare exists? → is_public? → denied
-- `get_accessible_resources(orguser, model_class)` — returns queryset: owned + shared + public (for listing endpoints)
-- `share_resource(sharer, resource, target_orguser, permission)` — creates ResourceShare
-- `unshare_resource(sharer, resource, target_orguser)` — deletes ResourceShare
+- `can_access(orguser, resource, required="view")` — checks: creator? → role is Analyst+ (org-wide CRUD)? → ResourceShare exists? → is_public? → denied
+- `get_accessible_resources(orguser, model_class)` — returns queryset:
+  - **For Viewer role**: Only resources shared with them via ResourceShare (direct + inherited) + public
+  - **For Analyst+**: All org resources (current behavior) + shared resources from other orgs (future)
+- `share_resource(sharer, resource, target_orguser_or_email, permission)` — creates ResourceShare, handles inheritance for dashboards
+- `unshare_resource(sharer, resource, target_orguser)` — deletes ResourceShare + cascades inherited shares
 
-#### 3c. Sharing API endpoints (`ddpui/api/sharing_api.py`)
+#### 3d. Paste-to-share flow (V2 spec alignment)
+
+The share modal accepts multiple emails pasted at once. Backend processes each:
+
+**Matched email** (user exists in org):
+- Create `ResourceShare` with `status=active`, `shared_with=orguser`
+- Apply permission level (default: view)
+
+**Unmatched email** (user not on Dalgo):
+- Frontend shows warning: `⚠ xyz@fake.org - not found on Dalgo`
+- Option: `[Invite xyz@fake.org as Viewer] [Remove]`
+- If invited:
+  - Create invitation with `role=viewer` (backend-enforced for Analyst sharers)
+  - Create `ResourceShare` with `status=pending`, `shared_with_email=email`, `shared_with=null`
+  - Send invitation email
+  - On acceptance: Update `ResourceShare` to `status=active`, set `shared_with=new_orguser`
+
+#### 3e. Sharing API endpoints (`ddpui/api/sharing_api.py`)
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/sharing/{type}/{id}/` | GET | List who has access |
-| `/sharing/{type}/{id}/` | POST | Share with user(s) |
-| `/sharing/{type}/{id}/{share_id}/` | PATCH | Change permission level |
-| `/sharing/{type}/{id}/{share_id}/` | DELETE | Revoke access |
+| `/sharing/{type}/{id}/` | GET | List who has access (includes inherited shares) |
+| `/sharing/{type}/{id}/` | POST | Share with user(s) — accepts list of emails + permission |
+| `/sharing/{type}/{id}/{share_id}/` | PATCH | Change permission level (cascades to inherited if dashboard) |
+| `/sharing/{type}/{id}/{share_id}/` | DELETE | Revoke access (cascades inherited chart shares if dashboard) |
 | `/sharing/users/search/?q=` | GET | Search org users for share picker |
+| `/sharing/{type}/{id}/invite/` | POST | Invite unmatched email as Viewer + create pending share |
 
 New permissions: `can_share_charts`(77), `can_share_reports` (reuse 76 from Phase 1).
 
-#### 3d. Update listing endpoints
+#### 3f. Update listing endpoints
 
-Modify `list_dashboards()`, chart listing, and `list_snapshots()` to use `get_accessible_resources()` so users only see what they own + what's shared with them + public.
+Modify `list_dashboards()`, chart listing, and `list_snapshots()` to use `get_accessible_resources()`:
+- **Viewer**: Only sees resources explicitly shared with them (direct + inherited) + public
+- **Analyst+**: Sees all org resources (existing behavior maintained)
+- Charts inherited via dashboard sharing appear in the user's "My Charts" list
 
-#### 3e. Frontend share dialog
+#### 3g. Frontend share dialog
 
-Replace dead email code in `share-modal.tsx` with proper share UI:
-- User search/autocomplete → permission level selector
-- Current shares list → change permission / revoke
-- Public link toggle (existing)
-- Email sharing (existing from PR)
+Replace dead email code in `share-modal.tsx` with paste-to-share UI:
+- **Paste field**: Accept multiple emails, split on comma/space/newline
+- **Email validation**: Check each against org user list
+- **Matched users**: Show with avatar + name + role badge, default to view access
+- **Unmatched emails**: Show warning icon, "Invite as Viewer" or "Remove" options
+- **Current shares list**: Show all shared users with permission dropdown (view/edit) + revoke button
+- **Inherited shares indicator**: Badge showing "via [Dashboard Name]" for inherited chart shares
+- **Public link toggle**: Existing functionality
+- **Email sharing**: Existing from PR (reports only)
+- **Confirmation summary**: Before submitting, show summary of all actions
 
 **Files to create**: `ddpui/models/resource_sharing.py`, `ddpui/core/access_service.py`, `ddpui/api/sharing_api.py`, frontend share dialog
 **Files to modify**: `ddpui/api/dashboard_native_api.py`, `ddpui/api/charts_api.py`, `ddpui/api/report_api.py` (listing endpoints), `webapp_v2/components/ui/share-modal.tsx`
@@ -420,11 +482,13 @@ New permission: `can_manage_rls`(78), assigned to roles 1-2 only.
 
 ### Phase 5: Future Scope (Not Implemented)
 
-- **User Groups**: For bulk sharing (e.g., "Regional Team")
-- **Time-bound access**: `expires_at` on ResourceShare
-- **Audit logs**: Who accessed what resource when
-- **Analyst invite capability**: Let Analysts invite other Analysts
+- **Time-bound access**: `expires_at` on ResourceShare (for donors, temporary consultants)
+- **Audit logs**: Who accessed/shared/edited what resource when (visible to Account Managers)
+- **Admin sharing override**: Let Account Managers see all shared resources and adjust sharing
+- **Invite role control**: Optional toggle to restrict invite ability to Account Managers only
 - **Dashboard-level RLS override**: All charts in dashboard inherit RLS policy
+
+> **Note**: User Groups have been moved into Phase 3. See `groups_and_sharing_plan.md` for the full plan including data models, API endpoints, and frontend UX.
 
 ---
 
@@ -432,12 +496,18 @@ New permission: `can_manage_rls`(78), assigned to roles 1-2 only.
 
 ```
 Phase 1 (Role fixes)          → Independent, no new models, low risk
-Phase 2 (Frontend nav/routes) → Independent, frontend only, depends on Phase 1 permissions
-Phase 3 (Resource sharing)    → Independent, new model + API
+                                 Note: Viewer role rename + permission fix ships here,
+                                 but Viewer listing is org-wide until Phase 3 adds shared-only filtering
+Phase 2 (Frontend nav/routes) → Frontend only, depends on Phase 1 permissions
+Phase 3 (Resource sharing)    → New model + API. CRITICAL for Viewer role to work as V2 spec intends
+                                 (shared-only access). Also enables paste-to-share, chart inheritance,
+                                 and Analyst invite-as-Viewer
 Phase 4 (RLS)                 → Depends on Phase 1 (role definitions final)
 ```
 
 **Suggested order**: Phase 1 → Phase 2 (parallel with Phase 3 backend) → Phase 3 frontend → Phase 4
+
+**Important dependency**: The Viewer role is only fully useful after Phase 3 ships. In the interim (Phase 1 only), Viewers will see all org dashboards/charts — not ideal but acceptable as a transitional state. Phase 3 tightens this to shared-only.
 
 ---
 
@@ -606,17 +676,17 @@ Reports reuse `can_*_dashboards`. You can't control report access separately fro
 3. **Least privilege** — Each role gets only what it needs
 4. **NGO-friendly naming** — Clear names that non-technical org admins understand
 
-### Proposed Role Definitions
+### Proposed Role Definitions (V2 Spec Aligned)
 
 | Role | Name | Level | Focus | Who is this? |
 |---|---|---|---|---|
 | 1 | **Super Admin** | 5 | Everything + platform | Dalgo team / IT admin |
-| 2 | **Account Manager** | 4 | Everything except platform | Org admin / M&E lead |
-| 3 | **Pipeline Manager** | 3 | Data infrastructure + view consumption | Data engineer / IT staff |
-| 4 | **Analyst** | 2 | Data consumption + read-only infrastructure view | Program analyst / M&E officer |
-| 5 | **Viewer** | 1 | Read-only consumption | Program staff / external stakeholder |
+| 2 | **Account Manager** | 4 | Full access to all modules + user management + warehouse | Org admin / M&E lead |
+| 3 | **Pipeline Manager** | 3 | Full access to all modules including dashboards/charts, **except** user management and warehouse | Data engineer / IT staff / Implementation partner |
+| 4 | **Analyst** | 2 | Dashboards, charts, data explorer only. Can invite Viewers via share modal | Program analyst / M&E officer |
+| 5 | **Viewer** | 1 | View-only access to dashboards/charts **explicitly shared with them** | Program staff / partners / funders |
 
-**Key change**: Pipeline Manager and Analyst become **complementary peers**, not overlapping copies.
+**Key change (aligned with V2 spec)**: Pipeline Manager gets full access to all modules including dashboards/charts (same as Account Manager except user management and warehouse config). Analyst focuses on data consumption (dashboards, charts, data explorer). Viewer can **only** see resources explicitly shared with them (not org-wide access).
 
 ### Proposed Full Permission Matrix
 
@@ -680,26 +750,32 @@ Reports reuse `can_*_dashboards`. You can't control report access separately fro
 
 #### Visualization (Dashboards, Charts, Reports)
 
+> **V2 spec alignment**: Pipeline Manager has full dashboard/chart access (same as Account Manager except user/warehouse management). Viewer access is **shared-only** — they see only resources explicitly shared with them, not all org resources. The `can_view_dashboards`/`can_view_charts` permission for Viewer is a role-level gate; the actual resource listing is filtered by ResourceShare records (Phase 3).
+
 | Permission | SA | AM | PM | An | Viewer |
 |---|:---:|:---:|:---:|:---:|:---:|
-| `can_view_dashboards` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `can_create_dashboards` | ✓ | ✓ | - | ✓ | - |
-| `can_edit_dashboards` | ✓ | ✓ | - | ✓ | - |
-| `can_delete_dashboards` | ✓ | ✓ | - | ✓ | - |
-| `can_share_dashboards` | ✓ | ✓ | - | ✓ | - |
+| `can_view_dashboards` | ✓ | ✓ | ✓ | ✓ | ✓ * |
+| `can_create_dashboards` | ✓ | ✓ | ✓ | ✓ | - |
+| `can_edit_dashboards` | ✓ | ✓ | ✓ | ✓ | - |
+| `can_delete_dashboards` | ✓ | ✓ | ✓ | ✓ | - |
+| `can_share_dashboards` | ✓ | ✓ | ✓ | ✓ | - |
 | `can_manage_org_default_dashboard` | ✓ | ✓ | - | - | - |
-| `can_view_charts` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `can_create_charts` | ✓ | ✓ | - | ✓ | - |
-| `can_edit_charts` | ✓ | ✓ | - | ✓ | - |
-| `can_delete_charts` | ✓ | ✓ | - | ✓ | - |
+| `can_view_charts` | ✓ | ✓ | ✓ | ✓ | ✓ * |
+| `can_create_charts` | ✓ | ✓ | ✓ | ✓ | - |
+| `can_edit_charts` | ✓ | ✓ | ✓ | ✓ | - |
+| `can_delete_charts` | ✓ | ✓ | ✓ | ✓ | - |
 | `can_view_warehouse_data` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **`can_view_reports`** (NEW) | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **`can_create_reports`** (NEW) | ✓ | ✓ | - | ✓ | - |
-| **`can_edit_reports`** (NEW) | ✓ | ✓ | - | ✓ | - |
-| **`can_delete_reports`** (NEW) | ✓ | ✓ | - | ✓ | - |
-| **`can_share_reports`** (NEW) | ✓ | ✓ | - | ✓ | - |
+| **`can_view_reports`** (NEW) | ✓ | ✓ | ✓ | ✓ | ✓ * |
+| **`can_create_reports`** (NEW) | ✓ | ✓ | ✓ | ✓ | - |
+| **`can_edit_reports`** (NEW) | ✓ | ✓ | ✓ | ✓ | - |
+| **`can_delete_reports`** (NEW) | ✓ | ✓ | ✓ | ✓ | - |
+| **`can_share_reports`** (NEW) | ✓ | ✓ | ✓ | ✓ | - |
+
+> \* **Viewer**: Has the role-level permission but listing endpoints filter to only show resources explicitly shared with them via `ResourceShare` (Phase 3). Without any shares, Viewers see empty dashboards/charts/reports lists.
 
 #### User & Org Management
+
+> **V2 spec alignment**: Analysts can invite new users as Viewers via the sharing modal. The `can_create_invitation` permission is granted to Analysts, but the backend enforces that Analysts can **only** invite with the Viewer role. Account Managers can invite any role.
 
 | Permission | SA | AM | PM | An | Viewer |
 |---|:---:|:---:|:---:|:---:|:---:|
@@ -709,11 +785,13 @@ Reports reuse `can_*_dashboards`. You can't control report access separately fro
 | `can_delete_orguser` | ✓ | ✓ | - | - | - |
 | `can_edit_orguser` | ✓ | ✓ | - | - | - |
 | `can_edit_orguser_role` | ✓ | ✓ | - | - | - |
-| `can_create_invitation` | ✓ | ✓ | - | - | - |
+| `can_create_invitation` | ✓ | ✓ | - | ✓ ** | - |
 | `can_view_invitations` | ✓ | ✓ | ✓ | ✓ | - |
 | `can_edit_invitation` | ✓ | ✓ | - | - | - |
 | `can_delete_invitation` | ✓ | ✓ | - | - | - |
 | `can_resend_email_verification` | ✓ | ✓ | - | - | - |
+
+> \*\* **Analyst invitation constraint**: Backend enforces that when role=Analyst, the invitation API only allows `invited_role=viewer`. This is triggered from the share modal paste-to-share flow when an email is unmatched (user doesn't exist on Dalgo). The Analyst cannot choose the invitee's role — it is always Viewer.
 
 #### Settings & Platform
 
@@ -728,7 +806,7 @@ Reports reuse `can_*_dashboards`. You can't control report access separately fro
 | `can_request_llm_analysis_feature` | - | - | ✓ | ✓ | ✓ |
 | `can_view_usage_dashboard` | ✓ | ✓ | ✓ | ✓ | - |
 
-### Summary of Changes from Current State
+### Summary of Changes from Current State (V2 Spec Aligned)
 
 | Change | Current | Proposed | Impact |
 |---|---|---|---|
@@ -737,11 +815,14 @@ Reports reuse `can_*_dashboards`. You can't control report access separately fro
 | **Strip Analyst of task/pipeline write** | Analyst can create/run/delete tasks | Analyst has no orchestration perms | **Breaking** |
 | **Strip Analyst of sync sources** | Analyst can trigger syncs | No source access | **Breaking** |
 | **Strip Analyst of infrastructure view** | Analyst sees sources, warehouses, connections, pipelines | No infrastructure visibility | **Breaking** |
-| **Strip Pipeline Mgr of dashboard/chart CRUD** | PM can create/edit/delete | PM can only view | Intentional — PM focuses on infrastructure |
-| **Strip Guest/Viewer of infrastructure view** | Guest sees 15+ infrastructure perms | Viewer sees only dashboards/charts/reports | Simplification |
+| **Pipeline Mgr keeps dashboard/chart CRUD** | PM can create/edit/delete | PM **keeps** full dashboard/chart CRUD | No change — aligned with V2 spec ("same as AM except user mgmt & warehouse") |
+| **Strip Guest/Viewer of infrastructure view** | Guest sees 15+ infrastructure perms | Viewer sees only shared dashboards/charts/reports | Simplification |
+| **Viewer sees only shared resources** | Guest sees all org dashboards (if had permission) | Viewer sees **only** resources explicitly shared with them | **Requires Phase 3** — ResourceShare model must be in place |
+| **Analyst can invite Viewers** | Only SA/AM can invite | Analyst gets `can_create_invitation` (backend-limited to Viewer role) | New capability — from share modal paste-to-share flow |
+| **Chart inheritance from dashboards** | No inheritance | Charts inside shared dashboard auto-shared with same permission | New — inherited ResourceShare records with cascade |
 | **Add report-specific permissions** | Reports use `can_*_dashboards` | 5 new `can_*_reports` permissions | Non-breaking — new permissions |
 | **Add `can_accept_tnc` to Viewer** | Guest can't accept T&C | Viewer can accept T&C | Fix — Viewers need to accept T&C |
-| **Proposed new permission count** | SA:72, AM:71, PM:57, An:46, Gu:24 | SA:72, AM:71, PM:48, An:21, Vi:11 | Analyst and Viewer significantly tightened |
+| **Proposed new permission count** | SA:72, AM:71, PM:57, An:46, Gu:24 | SA:72, AM:71, PM:57, An:22, Vi:11 | Analyst tightened, PM unchanged |
 
 ### Open Question: Do some NGOs need a "Full Access" role?
 
