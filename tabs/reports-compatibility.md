@@ -1,6 +1,6 @@
 # DALGO REPORTS — TABS COMPATIBILITY
 ## Technical Specification
-**Version 1.0 • May 2026**
+**Version 1.1 • May 2026**
 
 ---
 
@@ -12,10 +12,12 @@
 |-----------|--------|-------|
 | M1 — Backend Fixes | 🟢 Complete | Schema + service fixes |
 | M2 — Backend Tests | 🟢 Complete | Unit tests for tab-based dashboards |
+| M3 — Frontend Fixes | 🟢 Complete | Summary above tabs, print layout, public view |
+| M4 — Data Migration | 🟢 Complete | Management command for old snapshots |
 
 **Current Focus:** Complete ✅
 
-**Last Updated:** May 7, 2026
+**Last Updated:** May 6, 2026
 
 **Status Legend:** 🔴 Not Started | 🟡 In Progress | 🟢 Complete
 
@@ -34,7 +36,7 @@ new structure, causing reports from tab-based dashboards to render blank.
 
 **Linear Ticket:** DALGO-1184
 
-**Branch:** `feature/reports-tabs-compatibility` (based on `feature/dashboard_tabs`)
+**Branch:** `feature/dashboard_tabs` (backend + frontend combined)
 
 ---
 
@@ -226,21 +228,101 @@ list. Returns empty result for tab-based dashboards.
 
 ---
 
+## Milestone 3 — Frontend Fixes
+
+**Goal:** Report viewer correctly renders tab-based snapshots with summary above tabs.
+
+---
+
+### Issues & Fixes
+
+#### FIX 6: Executive Summary positioned above tabs (CRITICAL)
+
+**Files:**
+- `webapp_v2/app/reports/[snapshotId]/page.tsx`
+- `webapp_v2/app/share/report/[token]/PublicReportView.tsx`
+
+**Problem:** Executive Summary was rendered inside the canvas (`beforeContent`), placing it below the TabBar. Team decision (Pradeep + Noopur): one summary per report, shown above all tabs.
+
+**Fix:** Moved summary block out of `DashboardNativeView`'s `beforeContent` prop and rendered it directly in the page between the fixed header and `DashboardNativeView`. TabBar (inside `DashboardNativeView`) now appears below the summary.
+
+---
+
+#### FIX 7: Print layout (PDF) supports tabs (CRITICAL)
+
+**File:** `webapp_v2/components/reports/print-layout.tsx`
+
+**Problem:** `PrintLayout` only rendered root-level `layout_config`/`components`. For tab-based dashboards both are empty, so the PDF was blank.
+
+**Fix:** Added tabs-aware rendering — iterates all tabs and renders their charts flat (no tab headings in PDF). Legacy root-level path kept for backward compatibility.
+
+---
+
+### M3 Progress Checklist
+
+- [x] `app/reports/[snapshotId]/page.tsx` — Summary moved above TabBar
+- [x] `app/share/report/[token]/PublicReportView.tsx` — Summary above TabBar in public view
+- [x] `components/reports/print-layout.tsx` — Tabs support in PDF print layout
+
+---
+
+## Milestone 4 — Data Migration
+
+**Goal:** Convert all existing old-format report snapshots to tabs format so frontend only deals with one structure.
+
+---
+
+### Decision
+
+Old snapshots store data at root level (`layout_config`, `components`). New snapshots store data inside `tabs[]`. Rather than write a Django schema migration (which runs automatically), a management command was written so it can be run explicitly per environment before deployment.
+
+---
+
+### Files
+
+- [x] `DDP_backend/ddpui/management/commands/migrate_report_snapshots_to_tabs.py`
+
+### Usage
+
+```bash
+# Preview changes (no DB writes)
+uv run python manage.py migrate_report_snapshots_to_tabs --dry-run
+
+# Apply migration
+uv run python manage.py migrate_report_snapshots_to_tabs
+```
+
+**Deploy order:** Run this command on each environment **before** deploying the new frontend code.
+
+---
+
 ## Acceptance Criteria
 
 ### Backend
-- [ ] `tabs` field added to `_freeze_dashboard()` output
-- [ ] `tabs` field added to `FrozenDashboardConfig` schema
-- [ ] `_extract_chart_ids()` helper created and used in both methods
-- [ ] `_freeze_chart_configs()` extracts charts from tabs
-- [ ] `discover_datetime_columns()` discovers columns from charts in tabs
-- [ ] Existing root-level dashboard tests still pass
+- [x] `tabs` field added to `_freeze_dashboard()` output
+- [x] `tabs` field added to `FrozenDashboardConfig` schema
+- [x] `_extract_chart_ids()` helper created and used in both methods
+- [x] `_freeze_chart_configs()` extracts charts from tabs
+- [x] `discover_datetime_columns()` discovers columns from charts in tabs
+- [x] Unit tests added for tab-based dashboard scenarios
+- [x] Existing root-level dashboard tests still pass
+
+### Frontend
+- [x] Executive summary shown above tabs (not inside tabs)
+- [x] PDF print layout renders charts from all tabs
+- [x] Public share view shows summary above tabs
+
+### Data Migration
+- [x] Management command migrates old root-level snapshots to tabs format
+- [x] Dry-run mode available for safe preview
+- [x] Empty snapshots safely skipped
 
 ### End-to-End
 - [ ] Can create report from tab-based dashboard
 - [ ] Report shows all tabs correctly
 - [ ] All charts from all tabs render with frozen data
 - [ ] Datetime column discovery works for charts in tabs
+- [ ] PDF download includes all tabs content
 - [ ] Old root-level dashboards still work (backward compatible)
 
 ---
