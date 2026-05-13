@@ -496,7 +496,7 @@ When a user clicks "Add Chart", the system checks which tab is currently active 
 | Feature | Description |
 |---------|-------------|
 | Migration Script | Move existing dashboard data into tabs structure |
-| Clear Root Level | Set root `layout_config` and `components` to empty |
+| Root Level Fields | Left intact for rollback safety — removed in follow-up PR |
 | Preview Mode | Hide tab bar for single tab, show for multiple tabs |
 | View Mode | Tab switching without edit controls |
 
@@ -505,8 +505,8 @@ When a user clicks "Add Chart", the system checks which tab is currently active 
 **Migration:**
 1. Run Django migration script
 2. For each existing dashboard, copy `layout_config` and `components` into first tab
-3. Clear root level fields (set to empty `[]` and `{}`)
-4. All dashboards now use `tabs` for data
+3. Root level `layout_config` and `components` are left as-is (not cleared) — this allows rollback if something goes wrong post-release
+4. Once release is stable, remove `layout_config` and `components` columns from DB in a follow-up cleanup PR
 
 **Preview Mode:**
 - Single tab → Tab bar hidden, looks like normal dashboard
@@ -526,9 +526,10 @@ def migrate_dashboards_to_tabs(apps, schema_editor):
                 'layout_config': dashboard.layout_config or [],
                 'components': dashboard.components or {}
             }]
-            dashboard.layout_config = []
-            dashboard.components = {}
-            dashboard.save()
+            # Root level layout_config and components are intentionally left intact
+            # for rollback safety. They will be removed in a follow-up cleanup PR
+            # after the release is confirmed stable.
+            dashboard.save(update_fields=["tabs"])
 ```
 
 ### Preview Mode Behavior
