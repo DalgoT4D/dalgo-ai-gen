@@ -6,7 +6,7 @@
 
 | Milestone | Status | Notes |
 |-----------|--------|-------|
-| M1 — Backend Model & Migration | 🟢 Complete | Fields removed from model + to_json(); schema migration 0161 created |
+| M1 — Backend Model & Migration | 🟢 Complete | Fields removed from model + to_json(); schema migration 0163 created |
 | M2 — Backend Schemas | 🟢 Complete | Removed root fields from DashboardResponse and FrozenDashboardConfig |
 | M3 — Backend Services & API | 🟢 Complete | Updated report_service, dashboard_service, chart_service, duplicate API |
 | M4 — Backend Tests | 🟢 Complete | Updated fixtures and assertions across all test files |
